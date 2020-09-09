@@ -1,0 +1,12 @@
+version: '3'
+services:
+  ubuntu:
+    network_mode: bridge
+    image: 'ctrlaltelite2012/cradlepoint_ubuntu_example:latest'
+    container_name: 'ubuntu-20.04'
+    ports:
+      - '8022:22'
+    volumes:
+      - $CONFIG_STORE
+    logging:
+      driver: json-file
