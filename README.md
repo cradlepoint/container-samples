@@ -4,7 +4,7 @@
 
   * ###### For Cradlepoint routers (IBR1700, AER2200, E300, E3000) with NCOS V7.2.20 or greater.
 
-  * ###### The IBR1700, AER2200, and E300 use ARM7 architecture, and the E3000 uses ARM64 architecture. They must be built for the correct architecture in order to run correctly.
+  * ###### The IBR1700 and AER2200 use ARM7 architecture, and the E300 and E3000 use ARM64 architecture. They must be built for the correct architecture in order to run correctly.
   
   * ###### This example assumes that you have included the ssh / openssh-server packages in your Dockerfile. This is not required if you don't want it installed.
 
