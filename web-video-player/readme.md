@@ -3,6 +3,8 @@
 ### Purpose:
 NGINX webserver with index.html serving embedded video using javascript library.
 
+![image](https://user-images.githubusercontent.com/7169690/221065573-005d6b62-7788-49ff-91b4-9ef174bae7fc.png)
+
 ### Build:
 1. Put your video in the folder and name it video.mp4 (or edit index.html and change the video source filename)
 2. Put your thumbnail image in the folder and name it thumbnail.png - this is displayed before the video is played
