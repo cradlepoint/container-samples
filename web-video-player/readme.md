@@ -15,7 +15,7 @@ docker login
 docker buildx build --platform linux/arm64,linux/arm/v7 -t docker-username/repo-name --push .  
 ```
 
-### Usage:
+### Setup Container:
 Create a new container project on your Cradlepoint router and enter the following into the project compose tab:  
 
 ```yaml
@@ -27,6 +27,16 @@ services:
     ports:
      - 8000:80
 ```
+
+### Watch video:
+#### From Netcloud Manager:
+- Use Remote Connect LAN Manager to connect to 127.0.0.1 port 8000 HTTP.  
+
+#### Locally:  
+- In the zone firewall, forward the PrimaryLAN zone to the RouterZone with DefaultAllowAll policy.  
+- Open a browser and navigate to your router IP address port 8000.  
+Example:  
+http://192.168.0.1:8000  
 
 ### Docker homepage:  
 https://hub.docker.com/r/cpcontainer/web-video-player
