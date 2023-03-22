@@ -1,5 +1,5 @@
 # speedtest-tracker
-This container runs a speedtest every hour and graphs the results. The back-end is written in Laravel and the front-end uses React. It uses Ookla's Speedtest cli to get the data and uses Chart.js to plot the results.
+This project runs the henrywhitaker3/speedtest-tracker:dev-arm container which runs a speedtest every hour and graphs the results. The back-end is written in Laravel and the front-end uses React. It uses Ookla's Speedtest cli to get the data and uses Chart.js to plot the results.
 
 ![image](https://user-images.githubusercontent.com/127797701/226963907-80ee2aae-f1d5-499b-9b84-ba0f6d8c8559.png)
 
@@ -30,6 +30,11 @@ volumes:
 ## Usage:  
 - Use NCM Remote Connect LAN Manager to create a profile for "Speedtest-Tracker" at 127.0.0.1 port 8000 protocol HTTP.
 - Connect to the "Speedtest-Tracker" profile you created.
+
+or
+
+- In the routers Zone Firewall, forward the PrimaryLAN Zone to the Router with DefaultAllowAll policy.
+- Browse to the IP address of your router, port 8000 (e.g. http://192.168.0.1:8000)
 
 ## Docker Hub:  
 https://hub.docker.com/r/henrywhitaker3/speedtest-tracker
