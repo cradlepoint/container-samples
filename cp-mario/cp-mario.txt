@@ -1,5 +1,0 @@
-version: '2.4'
-services:
-  cp-mario:
-    image: jgaudu/cp-mario
-    restart: unless-stopped
