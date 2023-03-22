@@ -4,7 +4,7 @@ No background music (sorry). Use arrow keys for left and right, 'A' and 'S' for 
   
 > ARM64 only  
 
-![image](https://user-images.githubusercontent.com/7169690/227014099-115bf2f4-a021-40dc-8e2e-d817643d41db.png)
+![image](https://user-images.githubusercontent.com/7169690/227016810-4c7c2f26-7bb5-4604-915c-c1220d17ad28.png)
 
 ## Setup:  
 - Edit your Cradlepoint router configuration and navigate to System > Containers > Projects and click Add.  
