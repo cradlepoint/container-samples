@@ -1,0 +1,14 @@
+version: '2.4'
+services:
+  speedtest:
+    image: henrywhitaker3/speedtest-tracker:dev-arm
+    ports:
+     - 8000:80
+    volumes:
+     - data:/config
+    environment:
+     - OOKLA_EULA_GDPR=true
+    restart: unless-stopped
+volumes:
+  data:
+    driver: local
