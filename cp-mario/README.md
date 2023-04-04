@@ -8,7 +8,7 @@ No background music (sorry). Use arrow keys for left and right, 'A' and 'S' for 
 
 ## Setup:  
 - Edit your Cradlepoint router configuration and navigate to System > Containers > Projects and click Add.  
-- Give your project a name ("Speedtest-Tracker") and click on the Compose tab.  
+- Give your project a name ("CP-Mario") and click on the Compose tab.  
 - Paste the following YAML into the compose tab of your project and click save:  
   
 ```yaml
