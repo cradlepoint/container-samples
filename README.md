@@ -1,89 +1,323 @@
-## Build and Publish a Docker Image for use on a Cradlepoint router
+# Running Containers on Ericsson Routers
 
-* ##### Requirements
+## Platform Overview
 
-  * ###### For Cradlepoint routers (IBR1700, AER2200, E300, E3000) with NCOS V7.2.20 or greater.
+Ericsson routers run containers on a Linux ARM64 (aarch64) platform using musl libc. Containers must be built for this target architecture and C library to function correctly.
 
-  * ###### The IBR1700 and AER2200 use ARM7 architecture, and the E300 and E3000 use ARM64 architecture. They must be built for the correct architecture in order to run correctly.
-  
-  * ###### This example assumes that you have included the ssh / openssh-server packages in your Dockerfile. This is not required if you don't want it installed.
+### Target Architecture
 
-###### 1. Download the Dockerfile and the docker-compose.yaml files to a folder. Change directory to this folder.
+- **Architecture:** ARM64 / aarch64
+- **C Library:** musl libc (not glibc)
+- **OS:** Linux
 
-###### 2. Test and build the docker container
+When building container images, ensure your base image and all compiled binaries target `linux/arm64` with musl libc. Alpine Linux is a common base image choice since it uses musl natively.
 
-```
-$ docker build -t <username/repository> .
-```
+## Container Configuration
 
-###### 3. Verify the container has been built
+### Networking
 
-```
-$ docker image ls
-```
+Containers use bridge networking by default. Each container gets its own isolated network namespace with a virtual bridge interface. To expose services externally, use port mappings or assign the container an IP on a LAN network.
 
-###### 4. Start the container in the background
+#### Default Bridge Network
 
-```
-$ docker run -itdP --name ubuntu_example <username/repository>
-```
+With the default bridge, the container receives an IP in the Docker internal subnet (starting at `172.17.0.2`). Services are reached via port mappings on the router's IP.
 
-###### 5. Verify SSH is running
+#### Placing a Container on a LAN IP
 
-```
-$ docker port ubuntu_example 22
-0.0.0.0:32770 <-- this port is random
-```
+To give a container its own IP address on a Local IP Network (LAN), define a custom Compose network that binds to an existing Local IP Network via its UUID. The container then appears as a distinct host on that LAN — reachable directly by IP without port mapping.
 
-###### 6. Connect to the random port via SSH
+1. Create a Local IP Network in NetCloud Manager (e.g., `192.168.150.0/24`)
+2. Find the network's UUID (see below)
+3. Reference it in the Compose YAML under `driver_opts`
+4. Optionally assign a static IP to the service
 
-```
-$ ssh ubuntu@localhost -p <listed_port>
-```
+#### Finding the LAN UUID
 
-###### 7. For multi-architecture builds, we will leverage the buildx experimental feature of Docker. To enable buildx, enable the Command Line Experimental Features of Docker. To accomplish this, run the following command from the terminal that will be used to build the container. If you are running Mac OS-X and have Docker Desktop installed, you can enable the experimental features from preferences menu.  
+**From NetCloud Manager (Configuration):**
 
-```
-$ export DOCKER_CLI_EXPERIMENTAL=enabled
-```
+In NCM, pull the device's configuration (JSON). The `lan` dictionary is keyed by UUID — each key is a Local IP Network UUID:
 
-###### 8. To support building different architectures, register multi-architecture QEMU kernel handlers with host kernel by execute the following command to run the binfmt docker container.  You man need to run this command each time you reboot your host machine.
-
-```
-$ docker run -it --rm --privileged docker/binfmt:a7996909642ee92942dcd6cff44b9b95f08dad64
-```
-
-###### 9. Next, setup a builder for building multi-architecture Docker images.
-
-```
-$ docker buildx create --name mybuilder
-$ docker buildx use mybuilder
+```json
+{
+  "lan": {
+    "00000002-0d93-319d-8220-4a1fb0372b51": {
+      "ip_address": "192.168.150.1",
+      "netmask": "255.255.255.0",
+      ...
+    },
+    "00000000-0d93-319d-8220-4a1fb0372b51": {
+      "ip_address": "192.168.250.1",
+      "netmask": "255.255.255.0",
+      ...
+    }
+  }
+}
 ```
 
-###### 10. To ensure the builder is setup correctly, execute the following command and verify the output is similar to what is shown below. It is important to verify the desired target architecture is listed in Platforms. 
+**From the local router NCOS CLI:**
+
+Connect to the router CLI (SSH or console) and query the Config Store:
 
 ```
-$ docker buildx inspect --bootstrap
-
-Name: mybuilder
-Driver: docker-container
-Nodes:
-Name: mybuilder0
-Endpoint: unix:///var/run/docker.sock
-Status: running
-Platforms: linux/amd64, linux/arm64, linux/ppc64le, linux/s390x, linux/386, linux/arm/v7, linux/arm/v6
+get config/lan
 ```
 
-###### 11. Ensure that you are logged into DockerHub:
+This returns the list of Local IP Networks. Each network object is keyed by its UUID:
 
 ```
-$ docker login
+config/lan/00000002-0d93-319d-8220-4a1fb0372b51
+config/lan/00000000-0d93-319d-8220-4a1fb0372b51
 ```
 
-###### 12. Once the builder is setup, we can build the Docker image(s) and push to the repository that was created previously. In this example, the Docker image is built for the ARM7 architecture. Also note that you need to specify your repository information.
+To inspect a specific network's details:
 
 ```
-$ docker buildx build --platform linux/arm/v7 --no-cache -t <username/repository>:<tag> . --push
+get config/lan/00000002-0d93-319d-8220-4a1fb0372b51
 ```
 
-###### 13. At this point, the custom ubuntu docker image has been created and pushed to a repository where the router container runtime can pull the image down to the router and run it. This can take a few minutes to pull down. By default, the ports exposed by the containers will also be accessible on the WAN. To block these ports on the WAN, a zone firewall policy must be configured.
+The output includes `ip_address`, `netmask`, and other settings you'll need to match in the Compose YAML's `ipam` config.
+
+```yaml
+version: '2.4'
+services:
+  my-service:
+    image: my-image:latest
+    networks:
+      container-lan:
+        ipv4_address: 192.168.150.10
+
+networks:
+  container-lan:
+    driver: bridge
+    driver_opts:
+      com.cradlepoint.network.bridge.uuid: 00000002-0d93-319d-8220-4a1fb0372b51
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.168.150.0/24
+          gateway: 192.168.150.1
+```
+
+A service can attach to multiple LAN networks by listing them under its `networks:` key:
+
+```yaml
+version: '2.4'
+services:
+  my-service:
+    image: my-image:latest
+    networks:
+      lan1:
+        ipv4_address: 192.168.150.10
+      lan2:
+        ipv4_address: 192.168.250.10
+
+networks:
+  lan1:
+    driver: bridge
+    driver_opts:
+      com.cradlepoint.network.bridge.uuid: 00000002-0d93-319d-8220-4a1fb0372b51
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.168.150.0/24
+          gateway: 192.168.150.1
+  lan2:
+    driver: bridge
+    driver_opts:
+      com.cradlepoint.network.bridge.uuid: 00000000-0d93-319d-8220-4a1fb0372b51
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.168.250.0/24
+          gateway: 192.168.250.1
+```
+
+The recommended workflow is to let the Compose Builder in NetCloud Manager generate the network YAML after adding networks in the UI, rather than hand-writing UUIDs.
+
+### Ports
+
+When using the default bridge network, ports must be explicitly mapped between the host and the container:
+
+- Map specific TCP or UDP ports from the host to the container
+- Both the host port and container port must be specified
+- Multiple port mappings can be defined per container
+
+**Important:** Mapped ports are exposed on all LAN and WAN interfaces, and the router firewall does not block them. This is not recommended for secure services — use a LAN IP network assignment instead to control which interfaces the service is reachable on.
+
+```yaml
+services:
+  my-service:
+    image: my-image:latest
+    ports:
+      - "8080:80"        # host:container TCP
+      - "8443:443"       # HTTPS
+      - "5000:5000/udp"  # UDP port
+      - "9090:9090/tcp"  # Explicit TCP
+```
+
+### Volumes
+
+Data persistence is achieved through named volumes. The router does not allow host filesystem mounts — only named volumes, Config Store, and USB storage are available.
+
+- Named volumes are shared between containers in the same project
+- Data in named volumes persists across container restarts
+- Volume data is NOT updated when a new image is deployed (create a new project for fresh volumes)
+- Be mindful of available storage space on the router
+
+```yaml
+version: '2.4'
+services:
+  my-service:
+    image: my-image:latest
+    volumes:
+      - shared-data:/var/tmp       # Named volume
+      - $CONFIG_STORE              # Config Store access (bare, no mount path)
+
+volumes:
+  shared-data:
+    driver: local
+```
+
+For USB storage (requires NCOS 7.23.20+), add `$USB_STORAGE` as a volume. The device mounts at `/var/media` inside the container.
+
+### Devices
+
+Host devices can be passed through to containers when hardware access is required:
+
+- Serial ports (e.g., `/dev/ttyUSB0`)
+- USB devices
+- Other character or block devices available on the host
+
+Device passthrough gives the container direct access to the hardware, so appropriate permissions must be configured.
+
+```yaml
+services:
+  my-service:
+    image: my-image:latest
+    devices:
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
+      - "/dev/ttyS0:/dev/ttyS0"
+      - "/dev/snd:/dev/snd"
+```
+
+### Environment Variables
+
+Environment variables can be set at container launch to configure application behavior without modifying the image. This is useful for:
+
+- API endpoints and credentials
+- Feature flags
+- Runtime configuration that varies between deployments
+
+```yaml
+services:
+  my-service:
+    image: my-image:latest
+    environment:
+      - API_ENDPOINT=https://api.example.com
+      - LOG_LEVEL=info
+      - FEATURE_FLAG_ENABLED=true
+      - TZ=UTC
+```
+
+### Resource Constraints
+
+Router hardware has limited CPU and memory compared to server environments. Consider:
+
+- **Memory limits** — Set appropriate memory caps to prevent a container from exhausting system resources
+- **CPU limits** — Restrict CPU usage to leave headroom for router operations
+- **Restart policies** — Configure automatic restart behavior for fault tolerance
+
+```yaml
+version: '2.4'
+services:
+  my-service:
+    image: my-image:latest
+    mem_limit: 128M
+    restart: unless-stopped
+```
+
+### Restart Policies
+
+```yaml
+services:
+  my-service:
+    image: my-image:latest
+    restart: unless-stopped   # Restart on failure, not on manual stop
+
+  my-critical-service:
+    image: my-image:latest
+    restart: always           # Always restart regardless of exit status
+
+  my-oneshot-task:
+    image: my-image:latest
+    restart: on-failure       # Only restart if exit code is non-zero
+```
+
+## Build Considerations
+
+- Always cross-compile or build on an ARM64 environment
+- Verify that all dependencies are available for musl libc (some libraries assume glibc)
+- Keep images minimal to conserve storage and reduce attack surface
+- Statically linked binaries avoid C library compatibility issues entirely
+- Multi-stage builds help reduce final image size
+
+Build images locally or in CI targeting `linux/arm64`, then push to a registry. The router pulls pre-built images only — `build:` directives in Compose are not supported on the device.
+
+## Container Lifecycle
+
+Containers on routers should be designed to:
+
+- Start automatically on boot
+- Handle restarts gracefully
+- Recover from unexpected shutdowns
+- Log output to accessible locations for troubleshooting
+
+```yaml
+services:
+  my-service:
+    image: my-image:latest
+    restart: unless-stopped
+    logging:
+      driver: json-file
+```
+
+## Full Compose Example
+
+A complete `docker-compose.yml` combining all concepts:
+
+```yaml
+version: '2.4'
+services:
+  my-service:
+    image: my-user/my-image:latest
+    networks:
+      container-lan:
+        ipv4_address: 192.168.150.10
+    volumes:
+      - app-storage:/app/storage
+      - $CONFIG_STORE
+    devices:
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
+    environment:
+      - API_ENDPOINT=https://api.example.com
+      - LOG_LEVEL=info
+    mem_limit: 128M
+    restart: unless-stopped
+    logging:
+      driver: json-file
+
+networks:
+  container-lan:
+    driver: bridge
+    driver_opts:
+      com.cradlepoint.network.bridge.uuid: 00000002-0d93-319d-8220-4a1fb0372b51
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.168.150.0/24
+          gateway: 192.168.150.1
+
+volumes:
+  app-storage:
+    driver: local
+```

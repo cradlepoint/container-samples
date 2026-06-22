@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Edge AI Person Detection</title>
+    <link rel="stylesheet" type="text/css" href="/static/css/style.css">
+    <link rel="stylesheet" type="text/css" href="/static/css/font-awesome.min.css">
+</head>
+<body>
+    <div class="app-container">
+        <header class="app-header">
+            <div class="header-content">
+                <div class="logo-section">
+                    <i class="fas fa-video"></i>
+                    <h1 id="app-title">Edge AI Person Detection</h1>
+                </div>
+                <div class="header-actions">
+                    <span class="session-indicator" id="session-indicator">
+                        <i class="fas fa-user"></i> <span id="session-role">Connecting...</span>
+                    </span>
+                    <button type="button" class="help-toggle" id="help-toggle" title="Help">
+                        <i class="fas fa-question-circle"></i>
+                    </button>
+                    <button type="button" class="dark-mode-toggle" id="dark-mode-toggle" title="Toggle Dark Mode">
+                        <i class="fas fa-moon"></i>
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <main class="app-main">
+            <div id="control-lock-banner" class="control-lock-banner">
+                <i class="fas fa-lock"></i> Controls locked — another user has control
+            </div>
+
+            <div class="video-section">
+                <div class="video-controls">
+                    <button type="button" class="btn btn-success" id="btn-start" title="Start Detection">
+                        <i class="fas fa-play"></i> Start
+                    </button>
+                    <button type="button" class="btn btn-danger" id="btn-stop" title="Stop Detection" style="display:none;">
+                        <i class="fas fa-stop"></i> Stop
+                    </button>
+                    <span class="detection-state" id="detection-state">Stopped</span>
+                </div>
+                <div class="video-card">
+                    <img id="video-stream" src="/stream" alt="Live Video Stream">
+                </div>
+                <div class="video-info" id="video-info">
+                    <span><i class="fas fa-expand"></i> Stream: <span id="info-stream-res">--</span> @ <span id="info-source-fps">--</span> fps</span>
+                    <span><i class="fas fa-palette"></i> Color: Full RGB</span>
+                    <span><i class="fas fa-brain"></i> Model input: <span id="info-model-res">300x300</span></span>
+                    <span><i class="fas fa-microchip"></i> <span id="info-model-name">SSD MobileNet V2</span></span>
+                </div>
+            </div>
+
+            <div class="controls-grid">
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2><i class="fas fa-sliders-h"></i> Configuration <i class="fas fa-chevron-down panel-toggle"></i></h2>
+                    </div>
+                    <div class="panel-content">
+                        <div class="form-field">
+                            <label for="rtsp-url">RTSP URL</label>
+                            <input type="text" id="rtsp-url" class="form-input"
+                                   maxlength="2048" placeholder="rtsp://192.168.0.33:8554/stream">
+                            <div id="error-rtsp" class="error-msg"></div>
+                        </div>
+                        <div class="form-field">
+                            <label for="confidence-threshold">Confidence Threshold (0.1 - 1.0, step 0.05)</label>
+                            <input type="number" id="confidence-threshold" class="form-input"
+                                   min="0.1" max="1.0" step="0.05" value="0.4">
+                            <div id="error-confidence" class="error-msg"></div>
+                        </div>
+                        <div class="form-field">
+                            <label for="target-fps">Target FPS (1 - 30)</label>
+                            <input type="number" id="target-fps" class="form-input"
+                                   min="1" max="30" step="1" value="10">
+                            <div id="error-fps" class="error-msg"></div>
+                        </div>
+                        <div class="form-field">
+                            <label for="skip-frames">Skip Inference Frames (0 = disabled, 1-10)</label>
+                            <input type="number" id="skip-frames" class="form-input"
+                                   min="0" max="10" step="1" value="0">
+                            <div id="error-skip" class="error-msg"></div>
+                        </div>
+                        <div class="form-field">
+                            <label for="jpeg-quality">Stream Quality (1-100, lower = faster)</label>
+                            <input type="number" id="jpeg-quality" class="form-input"
+                                   min="1" max="100" step="5" value="70">
+                            <div id="error-jpeg" class="error-msg"></div>
+                        </div>
+                        <div class="toggle-grid">
+                            <label class="toggle-label">
+                                <input type="checkbox" id="toggle-bboxes" checked> Bounding Boxes
+                            </label>
+                            <label class="toggle-label">
+                                <input type="checkbox" id="toggle-labels" checked> Confidence Labels
+                            </label>
+                            <label class="toggle-label">
+                                <input type="checkbox" id="toggle-fps" checked> FPS Overlay
+                            </label>
+                            <label class="toggle-label">
+                                <input type="checkbox" id="toggle-detcount" checked> Detection Count
+                            </label>
+                        </div>
+                        <button type="button" class="btn btn-primary" id="apply-btn">
+                            <i class="fas fa-check"></i> Apply Configuration
+                        </button>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2><i class="fas fa-info-circle"></i> Model Info <i class="fas fa-chevron-down panel-toggle"></i></h2>
+                    </div>
+                    <div class="panel-content">
+                        <div class="form-field">
+                            <label for="model-select">Detection Model</label>
+                            <select id="model-select" class="form-select">
+                                <option value="ssd_mobilenet_v2" selected>SSD MobileNet V2 (300x300, faster)</option>
+                                <option value="yolov5n">YOLOv5n (320x320, more accurate)</option>
+                            </select>
+                            <div id="error-model" class="error-msg"></div>
+                        </div>
+                        <div class="info-grid">
+                            <div class="info-row">
+                                <span class="info-label">Model</span>
+                                <span class="info-value" id="info-model">SSD MobileNet V2 (INT8)</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Inference Input</span>
+                                <span class="info-value" id="info-input">300x300 RGB uint8</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Display Output</span>
+                                <span class="info-value" id="info-output">Full resolution, full color (BGR24)</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Detection Class</span>
+                                <span class="info-value">Person only (COCO class 0)</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Runtime</span>
+                                <span class="info-value">TFLite + XNNPACK (4 threads)</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Stream Resolution</span>
+                                <span class="info-value" id="info-stream">Waiting for stream...</span>
+                            </div>
+                        </div>
+                        <p class="info-note">
+                            <i class="fas fa-eye"></i>
+                            The video you see is the full-resolution, full-color RTSP stream with detection overlays.
+                            The model processes a downscaled 300x300 copy internally for speed.
+                        </p>
+                    </div>
+                </div>
+
+                <div class="panel panel-full-width">
+                    <div class="panel-header">
+                        <h2><i class="fas fa-tachometer-alt"></i> Resource Usage <i class="fas fa-chevron-down panel-toggle"></i></h2>
+                    </div>
+                    <div class="panel-content">
+                        <div class="resource-chart" id="resource-chart">
+                            <canvas id="resource-canvas" width="400" height="120"></canvas>
+                        </div>
+                        <div class="resource-legend">
+                            <span class="legend-item"><span class="legend-color cpu-color"></span> CPU</span>
+                            <span class="legend-item"><span class="legend-color mem-color"></span> Memory</span>
+                            <span class="legend-item"><span class="legend-color fps-color"></span> FPS (% of target)</span>
+                        </div>
+                        <div class="resource-values">
+                            <span>CPU: <strong id="cpu-percent">0%</strong> | Mem: <strong id="mem-percent">0%</strong> (<span id="mem-detail">0 MB</span>) | FPS: <strong id="fps-percent">0%</strong></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <div id="help-modal" class="help-modal">
+        <div class="help-modal-content">
+            <div class="help-modal-header">
+                <h2>Edge AI Person Detection — Help</h2>
+                <button type="button" class="help-close" id="help-close"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="help-modal-body" id="help-modal-body">
+                Loading...
+            </div>
+        </div>
+    </div>
+
+    <div id="toast-container" class="toast-container"></div>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
