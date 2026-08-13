@@ -1,4 +1,4 @@
-# Edge AI Person Detection — Help
+# Edge AI Person Detection
 
 ## Overview
 
