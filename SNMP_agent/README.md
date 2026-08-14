@@ -1,10 +1,10 @@
 # SNMP Agent Container
 
-An SNMP agent container for Ericsson (Cradlepoint) NCOS routers that exposes router interface statistics, ARP tables, and other network data via standard SNMP MIBs.
+An SNMP agent container for Ericsson (Cradlepoint) NCOS routers that provides stable interface indexing (ifIndex) for SNMP monitoring. The router's built-in SNMP agent reassigns ifIndex values when services or interfaces restart, which breaks NMS polling, graphing continuity, and alerting rules that rely on consistent interface identifiers. This container masks that behavior by maintaining its own deterministic interface table derived from the router's Config Store, ensuring ifIndex values remain consistent across service restarts.
 
 ## What It Does
 
-This container runs a Net-SNMP daemon (`snmpd`) that serves SNMP data sourced from the router's Config Store. It uses `pass_persist` handlers to dynamically populate MIB tables with live router data, and proxies requests for other MIBs to the router's built-in SNMP agent.
+This container runs a Net-SNMP daemon (`snmpd`) that rebuilds interface and network tables from the router's Config Store on a fixed schedule rather than relying on the kernel's volatile interface numbering. It uses `pass_persist` handlers to serve a stable OID tree to SNMP managers, and proxies requests for other MIBs to the router's built-in agent.
 
 ### Supported MIBs
 

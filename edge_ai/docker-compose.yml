@@ -1,0 +1,10 @@
+version: "2.4"
+
+services:
+  edge-ai:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    mem_limit: 1g
+    cpus: 4

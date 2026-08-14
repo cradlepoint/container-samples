@@ -1,0 +1,16 @@
+# Edge AI Person Detection - Production Dependencies
+# Core
+numpy==1.26.4
+Pillow==10.4.0
+
+# Inference (TFLite with XNNPACK for ARM64 NEON)
+ai-edge-litert==2.1.5
+
+# Video capture (RTSP via ffmpeg)
+av==13.1.0
+
+# Performance: OpenCV for NEON-accelerated resize/color conversion
+opencv-python-headless==4.10.0.84
+
+# Required by cp.py for router API communication
+requests==2.32.3

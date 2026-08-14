@@ -1,0 +1,14 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Read Docs Before Task",
+      "trigger": "UserPromptSubmit",
+      "description": "Before starting a spec task, read the container development documentation and lessons learned to understand constraints and best practices for building containers on Cradlepoint NCOS routers.",
+      "action": {
+        "type": "agent",
+        "prompt": "Before starting this task, read the following documentation files to understand the constraints and best practices for building containers on Cradlepoint NCOS routers:\n1. docs/container-development-guide.md\n2. docs/ncos-sdk-reference.md\n3. docs/memory-resources.md\n4. .kiro/steering/lessons-learned.md\n\nApply the knowledge from these docs and any lessons learned to the task you are about to execute."
+      }
+    }
+  ]
+}

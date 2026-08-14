@@ -1,0 +1,14 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Reflect After Task",
+      "trigger": "Stop",
+      "description": "After completing a spec task, reflect on what was learned, what was new or surprising, and whether any documentation, steering, or hooks should be updated with general-purpose improvements.",
+      "action": {
+        "type": "agent",
+        "prompt": "Now that this task is complete, reflect on the work you just did:\n\n1. **What was new or surprising?** Did you encounter any constraints, behaviors, or patterns that were not covered in the documentation?\n2. **What was incorrect?** Did any documentation or steering advice turn out to be wrong or misleading?\n3. **What general lessons were learned?** Think about patterns that would apply to ANY future container build, not just this specific one.\n\nIf you identified general improvements, update the following files:\n- `.kiro/steering/lessons-learned.md` — Append new lessons under a dated section\n- `docs/` files — Fix any inaccuracies or add missing information\n- `.kiro/steering/container-building.md` — Update the workflow if the process should change\n\nIMPORTANT: Only include general-purpose improvements. Do NOT add anything specific to the container you just built."
+      }
+    }
+  ]
+}

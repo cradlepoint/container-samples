@@ -4,7 +4,7 @@
   "description": "After completing a spec task, reflect on what was learned, what was new or surprising, and whether any documentation, steering, or hooks should be updated with general-purpose improvements.",
   "version": "1",
   "when": {
-    "type": "postTaskExecution"
+    "type": "stop"
   },
   "then": {
     "type": "askAgent",

@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.hypothesis
+tests/
+requirements-dev.txt
+.git
+.gitkeep
+*.pt

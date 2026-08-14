@@ -29,7 +29,7 @@ When a user asks you to build, create, or develop a container for a Cradlepoint/
 Follow these conventions established in this repo:
 
 1. **Dockerfile**:
-   - Use `alpine:3.18` as the base image unless there's a specific reason not to
+   - Use `alpine:latest` as the base image unless there's a specific reason not to
    - Install only necessary packages with `--no-cache`
    - Copy application files to `/opt/<app_name>/`
    - Set `PYTHONPATH` if using cp.py

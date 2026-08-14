@@ -4,7 +4,7 @@
   "description": "Before starting a spec task, read the container development documentation and lessons learned to understand constraints and best practices for building containers on Cradlepoint NCOS routers.",
   "version": "1",
   "when": {
-    "type": "preTaskExecution"
+    "type": "userPromptSubmit"
   },
   "then": {
     "type": "askAgent",
