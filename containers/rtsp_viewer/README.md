@@ -140,33 +140,6 @@ leaves headroom for transcoding, which is heavier than idle relay.
 
 No `$CONFIG_STORE` volume is needed — this container never talks to `cp.py`.
 
-## Verified Before Deployment
-
-Everything below was run on a development machine, with no router involved:
-
-- Both architectures build (116 MB arm64, 75.9 MB arm/v7).
-- Ran the arm64 image natively and confirmed the API, RTSP and WebRTC listeners
-  all come up, and the web UI answers `200`.
-- Bind-mounted-config path: an existing `go2rtc.yaml` is used as-is and
-  `entrypoint.sh` does not touch it.
-- Environment-variable path: multiple `CAMERA<n>_URL`/`CAMERA<n>_NAME` pairs
-  and `WEBRTC_CANDIDATE` generate the expected YAML, confirmed by reading the
-  file back inside the container.
-- No env vars and no bind-mounted config: the container still starts with an
-  empty `streams:` list rather than crashing, so the web UI is reachable to
-  configure cameras through even from a bare deployment.
-- Auth: with `API_USERNAME`/`API_PASSWORD` and `RTSP_USERNAME`/`RTSP_PASSWORD`
-  set, an unauthenticated request to the published port gets `401` and an
-  authenticated one gets `200` — and a request made from inside the container
-  to `127.0.0.1` bypasses auth entirely, confirming go2rtc's documented
-  localhost exemption applies here too.
-- `docker stop` returns in well under a second, so go2rtc as PID 1 handles
-  `SIGTERM` directly with no entrypoint shell in the way.
-
-Not verifiable without a router: an actual camera feed, WebRTC playback
-through the router's real WAN/LAN NAT, and whether `WEBRTC_CANDIDATE` needs
-adjustment for a specific network's NAT behavior.
-
 ## Troubleshooting
 
 | Symptom | Cause |

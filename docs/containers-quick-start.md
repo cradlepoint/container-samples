@@ -92,7 +92,13 @@ features = cp.get('status/feature')   # or GET /api/status/feature
 
 ## Configuring a Container Registry
 
-By default, images are pulled from Docker Hub. To use a different registry:
+By default, images are pulled anonymously from Docker Hub, which only works
+against a **public** repository. A newly created Docker Hub repository is
+private by default, so a fresh push there fails on the router with an
+`unauthorized`/`denied` pull error until the repo's visibility is explicitly
+set to Public — see the FAQ entry below for the exact symptom.
+
+To use a private repository or a different registry:
 
 1. Navigate to SYSTEM > Containers > Registry
 2. Add the registry URL and credentials
@@ -145,6 +151,35 @@ mv main_copy.py main.py
 ```
 
 ## FAQ
+
+- **Pull fails with `denied: requested access to the resource is denied` /
+  `unauthorized: authentication required`?** The line just before these in
+  `status/log`, `No matching registry auth information for url ...`, is logged
+  on every anonymous pull attempt and is not itself diagnostic — it appears
+  identically for a successful public-image pull. The `unauthorized`/`denied`
+  pair is the actual failure, and Docker Hub returns the identical pair for
+  several different causes, so check them in this order:
+
+  1. **The `image:` value in the compose YAML does not exactly match what was
+     pushed.** Compare the two strings character for character, including
+     punctuation — `myimage-name` and `myimage_name` are different
+     repositories to Docker Hub, and pushing one while deploying the other
+     produces exactly this error with nothing router-specific about it. This
+     is the most common cause in practice; rule it out before assuming a
+     permissions problem.
+  2. **The repository is private.** Docker Hub repositories default to
+     **private** when first created — you have to explicitly set visibility
+     to Public for an anonymous pull to work.
+  3. **The repository or tag doesn't exist at all** (a typo, or it was never
+     pushed).
+
+  Docker Hub's error text does not distinguish any of these three from each
+  other. Confirm which one by running `docker pull namespace/repo:tag` — using
+  the exact string from the compose file — from a workstation while logged out
+  of Docker Hub. The same failure there confirms it's a registry-side
+  naming/visibility issue and not anything specific to the router. Fix by
+  correcting the name, making the repository public, or adding credentials for
+  it under [config/container/registry](ncos-api/config/container.md).
 
 - **Project appears in `container list` with no containers under it?** This one
   symptom has three different causes, and they are distinguishable. Note first

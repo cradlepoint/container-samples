@@ -271,6 +271,19 @@ cp.wait_for_wan_connection(timeout=120)
 
 See [ncos-sdk-reference.md](ncos-sdk-reference.md) for the full API.
 
+### Giving More Than One Consumer Access to the Config Store
+
+"Another application needs to read/write the Config Store too" resolves differently depending on where that application runs. Pick the narrowest scope that fits, since the last option carries real security weight the first two don't:
+
+- **Another process in the same container** — no special handling. `cp.py` is stateless; every call opens its own connection to `/var/tmp/cs.sock`. Any thread or subprocess can `import cp` and call it concurrently with no coordination needed.
+- **Another container in the same Compose project** — give that service its own `$CONFIG_STORE` entry and its own copy of `cp.py`. `$CONFIG_STORE` resolves to a bind mount of the same host socket for every service that lists it, so each container gets independent access; nothing needs to be proxied through the first container. Each service directory needs its own vendored `cp.py`, per the existing build-context constraint above — do not try to share one copy across services.
+- **Another process in the same container, in a different language** — no adapter needed either. `cs.sock` is already mounted into that container's filesystem namespace, so a process in any language with Unix domain socket support can connect to it directly and speak the same small protocol `cp.py` speaks. See [cs-sock-protocol.md](cs-sock-protocol.md) for the full wire format — exact request/response framing, field counts per verb, and a pseudocode client — written specifically so a client can be built without reading `cp.py`'s source.
+- **An external application that cannot embed a `cs.sock` client at all** (a genuinely separate host, or a device that isn't a container on this router) — this is the only case that needs a network-facing adapter, and it is the only case with real exposure: the adapter is handing out get/put/post/delete access to router configuration to whoever can reach it. If this is genuinely required:
+  - Authenticate the adapter. Do not expose `cp.put()`/`cp.post()`/`cp.delete()` to an unauthenticated caller.
+  - Allowlist writable paths explicitly, off by default, rather than forwarding an arbitrary path from the request. A service that can be driven to write anywhere in the config tree from the network is not safe to deploy. Reads can be broader than writes, but still scoped to what the caller actually needs.
+  - Keep it off a WAN `ports:` mapping unless the caller genuinely needs to reach it from outside the LAN. Mapped ports are exposed on WAN as well as LAN with no router firewall filtering, so bind to loopback for a same-container caller, or put it on a custom Compose network tied to a Local IP Network for a same-LAN caller.
+  - Verify writes by reading them back before reporting success, the same as any other `cp.py` write — see the Error Handling Contract in [ncos-sdk-reference.md](ncos-sdk-reference.md).
+
 ### What Does Not Work From a Container
 
 | Capability | Status | What to do |
@@ -463,6 +476,41 @@ curl -s localhost:18080/health
 #    forwarding signals.
 time docker stop -t 15 test
 ```
+
+A prompt stop proves PID 1 forwards the signal, but not that a Python polling
+loop *inside* that process reacts to it -- those are two different failure
+modes. A `signal.signal()` handler running does not make a blocked
+`time.sleep()` return early (Python retries the syscall to honor the full
+duration per PEP 475), so `while True: ...; time.sleep(interval)` with a
+flag-setting handler only exits on the *next* loop iteration after the current
+sleep completes, and a startup call to `cp.wait_for_uptime()` or another
+`wait_for_*` helper delays shutdown by up to its own `timeout` (300s default),
+since none of them take a stop flag. Test this specifically whenever a
+container polls in a loop or calls a `wait_for_*` function at startup: stop it
+while it is inside the sleep or the wait, not just at idle, and confirm the
+return time still matches what step 4 measured. See "Signal Handling in Polling
+Loops" in [ncos-sdk-reference.md](ncos-sdk-reference.md) for the interruptible
+sleep pattern.
+
+**The engine itself differs, and this matters for what "verified locally" can
+claim.** The commands above run against Docker Desktop (or plain Docker
+Engine) on the development machine. The router runs `cpdockerengine` — a
+different, more restricted runtime with no Docker API or socket exposed, only
+the `container` CLI and `status/container` (see
+[ncos-api/status/container.md](ncos-api/status/container.md)). It was
+historically balena-derived; whether that ancestry still holds on current
+firmware is unconfirmed and shouldn't be assumed. Most of what step 1-4 checks
+— does the image build and start, do packages exist for the target
+architecture, does the application's own logic behave correctly — transfers
+directly, because it's about the image contents, not the engine running it.
+Kernel-level behaviour such as how PID 1 receives signals inside a container
+also transfers, since that's a property of Linux namespaces rather than of
+Docker Engine specifically. But engine-specific behaviour — exact restart
+policy timing, health check polling internals, resource limit enforcement —
+is not verified by a local run just because the container itself behaved
+correctly, and this repo has no confirmed source for how `cpdockerengine`
+implements any of those. State plainly which category a claim falls into
+rather than presenting local-Docker-Desktop behaviour as router-verified.
 
 What running locally will not tell you: anything Config Store related. Without
 `cs.sock` every `cp.py` call returns `None`, so the application runs in its

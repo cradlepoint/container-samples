@@ -494,10 +494,14 @@ session in slightly different forms, so it leads.
   `memory`) before acting on it. More generally: a component reporting on the
   cause of its own failure is a hypothesis, not evidence.
 - Symptoms of a wedged container engine, distinct from resource exhaustion:
-  `balena-engine-containerd` `DeadlineExceeded` in `status/log`, a project listed
-  in `container list` with no containers under it, and a `status/container` read
-  that hangs rather than returning. A hanging status read is a health signal, not
-  a slow path or a wrong one.
+  a `containerd` `DeadlineExceeded` line in `status/log` (observed on this
+  router's firmware naming its containerd process with a `balena-` prefix —
+  the on-router engine is `cpdockerengine`, historically balena-derived, but
+  whether that ancestry still holds on current firmware is unconfirmed and
+  shouldn't be assumed for a different router or firmware version), a project
+  listed in `container list` with no containers under it, and a
+  `status/container` read that hangs rather than returning. A hanging status
+  read is a health signal, not a slow path or a wrong one.
 
 ### Reading router state
 
@@ -838,3 +842,413 @@ failure surface than building one, worth naming separately from Phase 2a
   deliberately (go2rtc uses it for transcoding codecs browsers can't play
   natively), so removing it would drop capability, which Phase 2a says to
   surface rather than do quietly.
+
+## 2026-08-15 (fourth entry) — A signal handler running does not unblock time.sleep()
+
+### The bug, and why "confirm signal handling" didn't catch it the first time
+
+- Built a container whose startup path called a stop-aware wait already, but
+  the very same pattern was initially written using the library's
+  `cp.wait_for_uptime(60)` directly plus a single `time.sleep(interval)` per
+  loop iteration, guarded only by a flag-setting `signal.signal()` handler.
+  Locally, with no router, `wait_for_uptime()` runs its full internal wait
+  before giving up (uptime never appears without a Config Store), so this was
+  exactly the condition where the bug would bite hardest.
+- **Confirmed directly, not inferred:** a `SIGTERM` handler that sets a module
+  flag runs immediately when the signal arrives, but the `time.sleep(N)` call
+  it interrupted still returns only after the full `N` seconds. Python retries
+  the underlying syscall to honor the originally requested duration (PEP 475)
+  unless the handler itself raises. A minimal repro (handler prints a
+  timestamp, then the sleep's return is timestamped separately) showed the
+  handler firing at t+1s and the 10s sleep still not returning until t+10s.
+- This means the existing "confirm signal handling" step in
+  `docs/container-development-guide.md` — timing `docker stop` at idle — proves
+  PID 1 forwards the signal, but says nothing about whether an in-process
+  polling loop reacts to it. **These are two different failure modes and the
+  first one does not test the second.** A container can pass the PID-1 check
+  and still take up to a full poll interval, or up to a `wait_for_*` function's
+  300-second default timeout, to actually stop.
+- **General rule for any future container with a polling loop or a startup
+  readiness wait: test `docker stop` while the process is inside the sleep or
+  the wait, not just when it's idle between iterations.** A single flag check
+  before the next `time.sleep()` call is not enough on its own — the sleep
+  itself has to be broken into short steps that recheck the flag, and any call
+  to `cp.wait_for_uptime()` / `wait_for_ntp()` / `wait_for_wan_connection()`
+  needs its own stop-aware wrapper if the container must shut down promptly
+  during that window, since none of those three take a stop flag or an event.
+- Checked every other cp.py-using sample in the repo for this pattern before
+  writing it up as a general lesson, since a one-off mistake isn't a repo-wide
+  finding. `edge_ai` and `gpsd_server` already sleep in short steps against a
+  `threading.Event`, and `SNMP_agent`'s only startup wait is inside its own
+  short-interval cache refresh loop — so this was a gap in this build, not an
+  existing pattern that had been silently wrong elsewhere. Worth checking
+  either way before generalizing a lesson from a single fix.
+- Fixed in `docs/ncos-sdk-reference.md` (new "Signal Handling in Polling Loops"
+  section, and the Readiness table and Usage Pattern now show the interruptible
+  form) and in `docs/container-development-guide.md`'s verification steps,
+  rather than only in this file, since the previous version of both examples
+  demonstrated the bug as the canonical pattern for anyone copying them.
+
+## 2026-08-15 (fifth entry) — Verification and simplification, proportionality lessons
+
+A single sample went through several rounds of "make this simpler" from the
+user, each round catching something the previous round should have caught
+too. The lessons are about proportionality and where information belongs,
+not about the sample itself.
+
+### Verification effort should match what the design actually needs, not what is technically knowable
+
+- While the sample still had a signal handler and an interruptible-sleep
+  wrapper, I went deep on characterizing exact PID-1 SIGTERM semantics —
+  whether an unhandled signal to PID 1 is default-ignored by the kernel,
+  whether `docker stop` was waiting out a sleep or waiting out its own
+  timeout, testing multiple variants to pin down the mechanism precisely.
+  That investigation was correct on its own terms but disproportionate: the
+  container had nothing to flush on shutdown, and the user had already asked
+  for something "very simple." **The point where verification depth should
+  stop is set by what the design actually needs to guarantee, not by how much
+  more there is to learn about the mechanism.** A stateless polling loop that
+  drops signal handling entirely does not need its shutdown timing
+  characterized to the second.
+- The general check before going deep on a verification question: does this
+  sample's own design depend on the answer? If a container has no state to
+  preserve on exit, exactly how fast `docker stop` returns is not a finding
+  worth investing in — note that it isn't instant and move on.
+
+### Simplification requests should remove the narrative scaffolding along with the code
+
+- Asked to strip signal handling and appdata from a sample, I removed the
+  named things but initially left behind material that existed only to
+  support them: a "Verified Before Deployment" section describing signal
+  handling behavior that no longer existed, and a multi-step NCM deployment
+  walkthrough where the rest of the file had already been cut down to a
+  single compose block's worth of content. Each of these needed its own
+  follow-up correction from the user instead of coming out in one pass.
+- **When removing a feature at a user's request, look for every place that
+  feature was *described*, not just where it was *implemented*, in the same
+  pass.** This is the same principle as the existing "removing a feature can
+  obsolete the abstractions that served it" lesson in this file, applied to
+  prose instead of code — a README section can be scaffolding for a design
+  decision exactly the way a lock or a deep-copy helper can.
+
+### Verification narrative does not belong in a sample's README
+
+- Three samples in this repo (not just the one being actively worked on) had
+  accumulated a "Verified Before Deployment" section in their README:
+  measured image sizes, what was tested locally against a mock Config Store,
+  signal-handling timing, what could not be verified without a router. This
+  is real information, but it is aimed at whoever is building or reviewing
+  the container, not at whoever is deploying it — and it goes stale the
+  moment the container's internals change, since nothing forces it to be
+  re-verified alongside a later edit.
+- Moved this out of every README it appeared in. It belongs in the chat
+  response at build time, which is naturally scoped to that specific change
+  and does not need to stay accurate indefinitely. A README should describe
+  what the container does, its files, configuration, building and
+  deployment — not the history of how it was checked. Added as an explicit
+  step in Phase 2b of the workflow so future builds do not reintroduce it.
+- Finding this required grepping the whole repo for the pattern (`^##
+  Verified`) once one instance was flagged, rather than only fixing the file
+  open in the editor. Consistent with the standing "sweep for the pattern
+  repo-wide once one instance is found" lesson already in this file — worth
+  re-noting because the trigger this time was a user correction on one file,
+  not something I noticed myself.
+
+### Don't infer platform identity from an artifact string
+
+- An earlier lesson in this file stated the on-router container engine was
+  "balena-derived" based on a log line naming a process
+  `balena-engine-containerd`. The user corrected this: the engine is
+  `cpdockerengine`, it may or may not still be balena underneath, and that
+  lineage should not be assumed current just because a component was once
+  named after it. **A process name, log string, or CLI tool name is evidence
+  of what something was called at some point, not necessarily of its current
+  implementation.** Naming survives rewrites more often than architecture
+  does. Corrected in `docs/ncos-api/status/container.md` and the relevant
+  lessons-learned entry to state the engine's current name
+  (`cpdockerengine`) as the fact and its balena ancestry as an unconfirmed,
+  possibly-outdated historical note rather than as an ongoing description of
+  the runtime.
+- This is a specific instance of the general "unverified claims presented as
+  fact" failure mode already tracked in this file, arriving from a different
+  direction: not a claim about platform *capability* that nobody tested, but
+  a claim about platform *identity* inferred from a naming artifact rather
+  than from documentation or a direct check. Worth watching for both forms.
+
+## 2026-08-15 (sixth entry) — A log line that looks like the error is a red herring
+
+### The misleading claim, and where it had spread
+
+- A user hit a pull failure on a real router: `container logs` showed `No
+  matching registry auth information for url https://index.docker.io/v1/`
+  immediately followed by `unauthorized: authentication required` and
+  `denied: requested access to the resource is denied`. Two places in this
+  repo's own docs (`docs/ncos-api/control/container.md`, in two separate
+  spots) asserted that the "No matching registry auth" line is "usually
+  harmless for public images." That claim is misleading in exactly the case
+  that matters: it is true that the line *itself* appears on every anonymous
+  pull including successful ones, but the docs stated it as if the whole
+  situation were benign, when the lines immediately following it are the
+  actual failure and are not harmless at all.
+- Root cause in this case, and the most likely one in general: **a newly
+  created Docker Hub repository defaults to private.** An anonymous pull
+  against a private repo gets rejected with the identical `unauthorized`/
+  `denied` pair that a pull against a nonexistent repo would get — Docker Hub
+  deliberately does not distinguish "private" from "doesn't exist" in the
+  error, so the fix (make it public, or add registry credentials on the
+  router) can't be read off the error text alone. Confirmed by checking Docker
+  Hub's own default-visibility behavior and by the error text matching the
+  documented Docker Hub v2 registry error format exactly.
+- **General rule for reading any log line that's labeled "usually harmless" or
+  similar in existing docs: check what immediately follows it before treating
+  the situation as benign.** A single line's harmlessness does not imply the
+  lines around it are harmless too, and a log message that is unconditionally
+  emitted (here, on every anonymous pull attempt regardless of outcome) is
+  never itself diagnostic — only a change in what follows it is.
+- Fixed both occurrences in `docs/ncos-api/control/container.md` and added an
+  explicit FAQ entry plus a note in the registry-configuration section of
+  `docs/containers-quick-start.md`, since a reader troubleshooting a pull
+  failure is more likely to land in the quick-start doc than the low-level API
+  reference. Did not touch anything specific to the container that triggered
+  this — the fix is a documentation correction, not a code change.
+
+### This is a registry-visibility problem, not a router-side problem
+
+- Worth naming as its own category distinct from the "image architecture
+  doesn't match the router" and "manifest unknown" pull failures already
+  documented: those are about what was built, this one is about the pushed
+  image's *reachability*, and it is entirely reproducible off the router. The
+  fastest diagnostic is an anonymous pull from a workstation
+  (`docker pull namespace/repo:tag` while logged out, or with
+  `docker logout` first) — if that fails identically, the router is not the
+  variable at all, which is the same "verify the platform before debugging
+  your artifact" principle already in this file, just applied to a registry
+  instead of the container engine.
+
+## 2026-08-15 (seventh entry) — The real cause was a name mismatch, not registry auth
+
+### Diagnosed the wrong layer first
+
+- A user's pull failed with the classic `No matching registry auth` /
+  `unauthorized` / `denied` sequence. The previous entry in this file (and the
+  doc fixes that went with it) treated this as a Docker Hub visibility
+  problem — a very plausible read of that exact error text, and one worth
+  keeping in the docs, but it was not the actual cause here. The real problem
+  was that the pushed image was named with a hyphen
+  (`yourregistry/gps-logger`) while the compose file the router was told to
+  deploy had drifted to a different string in one section, an artifact of the
+  README having the image name written out separately in a Building section
+  and a Deployment section that had gone out of sync during earlier edits.
+  Docker Hub's `denied`/`unauthorized` pair does not distinguish "wrong name",
+  "private repo", and "doesn't exist" from each other, so the error text alone
+  never pointed at the actual cause.
+- **The cheapest diagnostic step — comparing the pushed tag string against the
+  deployed `image:` string character for character — should be step one, not
+  a fallback after ruling out registry-side explanations.** It costs nothing,
+  it's mechanical, and it doesn't require touching the router, Docker Hub, or
+  any credentials. Registry visibility and typo'd/nonexistent repositories are
+  real and worth documenting, but they're strictly more expensive to check
+  (visibility requires the user to look at Docker Hub settings; a genuine typo
+  requires re-reading both strings anyway) than a direct diff of two strings
+  the user can paste immediately. Re-ordered the troubleshooting entries in
+  `docs/containers-quick-start.md` and `docs/ncos-api/control/container.md` so
+  the name-match check leads.
+- **When multiple explanations are consistent with the same symptom, ask for
+  the one fact that discriminates between them before writing any docs.** Here
+  that fact was "what exact string did you push, and what exact string is in
+  the compose file" — a single, cheap question that would have found the real
+  cause immediately, versus three rounds of plausible-but-wrong theorizing
+  about registry semantics (which was accurate about Docker Hub's own
+  behavior, just not the actual problem in this case).
+
+### A README with the same value in two places is a latent bug, independent of any specific typo
+
+- The immediate trigger was traced to something this file already has a
+  general lesson about — a value duplicated across a doc going out of sync
+  after an edit — but it's worth restating in the specific form that bit this
+  build: **any time a sample's image name is written out more than once in a
+  README (once in a Building section, once in a Deployment section, for
+  example), that duplication is a standing risk of exactly this failure mode,
+  independent of whether a specific edit has already desynced them.** The fix
+  applied here was to make every occurrence of the name use the same
+  underscore-separated form as the directory and `CP_APP_NAME`, and to grep
+  the finished README for the name to confirm every instance matches. Recorded
+  as a Phase 2 Compose convention so future builds check this before finishing
+  rather than after a user hits the failure.
+
+## 2026-08-15 (eighth entry) — Checking my own cross-reference before it shipped
+
+Small, self-contained lesson from a doc-only session (no build performed): a
+just-written edit had the same defect this file has repeatedly found in
+*inherited* material.
+
+### A dangling cross-reference written in the same turn is just as real as an old one
+
+- While adding a new subsection to `docs/container-development-guide.md`
+  about scoping Config Store access to multiple consumers, I wrote "See
+  'Security Framing for Exposed Services' below" — a heading that does not
+  exist anywhere in `docs/`. The framing it pointed at was real, but it only
+  lived as prose in this steering file's Phase 1 notes, never promoted into
+  the docs. The 2026-08-15 (second entry) lesson already in this file
+  ("sweep for dangling backticked paths") was written for references
+  inherited from past edits or user-supplied material; this one shows the
+  same check applies to a citation added in the *current* turn, before
+  anything is presented as finished. A cross-reference is not exempt from
+  verification just because you just wrote it yourself.
+- Caught by rereading the edit before treating the section as done, not by a
+  separate sweep. **Any time a doc edit adds "see X below" or "see the X
+  section", grep the same file (or the target file) for that literal heading
+  text before moving on.** It's a few seconds and it is cheaper than a reader
+  hitting a dead reference later. Fixed by inlining the actual point (mapped
+  ports are exposed on WAN with no firewall filtering) instead of pointing at
+  a section that isn't there.
+- Generalizes past cross-references specifically: any claim of the form "see
+  X" or "documented in Y" written during the current edit deserves the same
+  skepticism as one inherited from history. The 2026-08-15 (second entry)
+  lesson already names this pattern for a *stated-but-not-done* claim
+  ("now documented in..."); this is the same failure at the moment of
+  writing, not at the moment of retrospective audit.
+
+## 2026-08-15 (ninth entry) — Naming a pattern without checking the repo's existing vocabulary first
+
+### Introduced a term that collides with an unrelated, already-loaded word
+
+- Asked for a same-container process that wraps `cp.py` behind a local HTTP
+  API for a different-language app to consume, I called it a "bridge" in
+  chat. This repo already has a name for close variants of this shape —
+  "adapter", used in `docs/container-development-guide.md`'s "Feeding
+  Config Store Data to an Off-the-Shelf Daemon" section for the mirror-image
+  case (a daemon consuming Config Store data via a loopback socket). Worse,
+  "bridge" is not a neutral synonym here: `network_mode: bridge` and
+  "Default Bridge Network" are established, frequently-referenced Docker
+  networking terms in the same document set, with a completely different
+  meaning. A reader skimming both concepts in the same doc would have two
+  unrelated things both called "bridge."
+- The docs edit made in the same session used "adapter" correctly and did not
+  repeat the mistake — this was confined to a chat response, but it would
+  have propagated into a doc or sample code if the user had asked to
+  scaffold it under that name, since a name coined in conversation tends to
+  get carried forward into filenames and headings without being
+  re-examined.
+- **Before coining a name for a new pattern, grep the docs/steering for
+  existing terminology covering the same or an adjacent shape**, and
+  separately check whether the candidate word is already claimed by an
+  unrelated concept in the same document set. Two failure modes, one check:
+  reinventing a name that already exists, and picking a name that collides
+  with something else. This is the naming-side analogue of the existing
+  "grep before fixing a suspected documentation defect" lesson — verify
+  against what's already there before adding something new, whether the
+  addition is code, a doc claim, or a name.
+
+## 2026-08-15 (tenth entry) — Label which parts of an example are fixed and which are a choice
+
+### Conflating a platform constraint with an implementation choice in the same explanation
+
+- When describing a same-container adapter wrapping `cp.py`, I gave one
+  concrete implementation (HTTP over a loopback TCP socket) without
+  distinguishing it from the actual fixed constraint in the same system: the
+  Config Store side (`cs.sock`) *is* a genuine Unix domain socket speaking a
+  fixed line-based protocol that `cp.py` must match exactly, but the
+  adapter-to-other-app side is a second, independent socket that I designed,
+  where transport (TCP vs. Unix domain socket) and wire format (HTTP vs.
+  anything else) were both arbitrary choices, not requirements. The user
+  reasonably assumed "socket" meant the same kind of socket throughout and
+  had to ask a follow-up to find out only one of the two hops was fixed.
+- **When an explanation involves two chained pieces and only one is
+  constrained by the platform, say explicitly which is which before
+  presenting a concrete implementation for either.** "This side is fixed by
+  the platform; this other side is my design choice, here are the
+  alternatives" costs one sentence and prevents a wrong generalization from
+  the one example given. This is a documentation-writing/explanation
+  discipline, not a code defect, but it generalizes the same way as the
+  cross-reference lessons already in this file: unstated context invites the
+  reader to draw a boundary in the wrong place.
+- This also generalizes beyond sockets: any time an answer presents "the"
+  implementation of something that actually has multiple independent axes of
+  choice (transport, format, framing, naming), name the axes and state which
+  are fixed by something external versus freely chosen, rather than
+  presenting a single concrete answer as if it were the only shape available.
+
+## 2026-08-15 (eleventh entry) — Started building the adapter before questioning whether it was needed
+
+### Same-container cross-language access to cs.sock doesn't need an adapter at all
+
+- A user asked for an adapter process (Python wrapping `cp.py` behind a local
+  HTTP or socket API) so a different-language app in the *same* container
+  could read/write the Config Store. I started building it — created the
+  sample directory, vendored `cp.py` into it — before it occurred to either
+  of us that the adapter was solving a problem that doesn't exist in the
+  same-container case. `/var/tmp/cs.sock` is already mounted into that
+  container via `$CONFIG_STORE`; it's a plain Unix domain socket speaking a
+  small line-based protocol. Any language with Unix socket support (which is
+  most mainstream ones) can connect to it directly and skip the adapter, the
+  second process, the multi-process supervisor it would need (`ash` has no
+  `wait -n`), and the health-check complication that comes with supervising
+  two processes. The user, not me, asked "wouldn't it be simpler to just
+  document cs.sock usage" — I should have asked that question myself before
+  writing any code.
+- **An adapter/proxy/wrapper process is only justified when there's a
+  concrete reason the consumer can't reach the underlying resource
+  directly.** In the same-container case there wasn't one — the socket is
+  already in the same filesystem namespace. The adapter earns its place in
+  the *other* two scenarios from this same conversation (a separate
+  container, or a genuinely external/non-container consumer), where there is
+  a real barrier (needing `cp.py`'s own protocol handling in another
+  language across a process boundary, or needing auth/allowlisting for a
+  network-facing caller). Conflating "another consumer wants this data" with
+  "therefore build a mediating service" skips the step of checking whether a
+  mediator is actually required for that specific scenario.
+- This is a distinct failure from the existing "Architecture smell" lesson
+  above (multi-process supervisor as a symptom of a daemon that shouldn't be
+  bundled) — that one was about a bundled *service*; this one is about
+  building a *mediating layer* in front of a resource the consumer already
+  has direct access to. Same family (reach for a supervisor/adapter
+  reflexively instead of first asking if it's needed), different trigger.
+  Worth keeping both since they catch different designs.
+- **General rule: before scaffolding a new sample/service to solve "app A
+  needs access to X", check whether A already has direct access to X in the
+  deployment shape actually being discussed.** Ask this before writing any
+  code, not just when a design feels effortful. It costs one question;
+  building the unneeded layer costs a whole sample plus its own docs and
+  vendored dependencies. Caught here only because the user asked directly —
+  worth internalizing so the same check happens without being prompted next
+  time.
+- Cleaned up the partially-scaffolded `containers/cp_adapter/` directory
+  (just a vendored `cp.py`, nothing built on it yet) rather than leaving a
+  dead sample directory in the repo.
+
+## 2026-08-15 (twelfth entry) — Generalizing a tested fact to untested siblings while writing a spec
+
+### One verb's confirmed behavior isn't automatically every verb's confirmed behavior
+
+- Writing `docs/cs-sock-protocol.md`, I stated "field count is exact per verb
+  and strict, sending too few fields hangs the socket" as a flat fact
+  covering every verb. Only `alert`'s strict-field-count hang was ever
+  actually tested against a live router (the 2026-08-15 probe recorded
+  earlier in this file). For `get`/`put`/`post`/`delete`/`decrypt`, the same
+  behavior is a reasonable inference — same protocol, same dispatch
+  mechanism in `cp.py` — but inference is not the same evidence class as a
+  direct test, and the draft didn't distinguish them.
+- This is the same failure family this file has tracked repeatedly (claims
+  presented as fact when they were actually untested extrapolations from a
+  plausible mechanism), just caught at first-draft time instead of after
+  the doc shipped and someone relied on it. Caught by rereading the new
+  document specifically looking for claims that generalize a single
+  confirmed observation across a whole category, not by a separate process
+  step — worth making it one: **when a spec/reference doc states a behavior
+  that was confirmed for one specific case, check whether the doc is
+  presenting it as confirmed for the whole category it's grouped under, and
+  narrow the wording to say so if the broader claim is inference, not test.**
+- Practical phrasing pattern that keeps the distinction without weakening the
+  practical guidance: state the safe assumption to build against ("treat
+  every verb this way regardless"), but separately and explicitly name which
+  instance is actually tested versus inferred. A reader building a client
+  gets the same actionable guidance either way; a reader auditing claims can
+  tell which sentence to trust as fact.
+- Generalizes beyond this doc: any time a new reference document consolidates
+  scattered facts of different confidence levels into one section (as this
+  one did, pulling from the alert-specific probe, the general error-handling
+  contract, and the wire-format testing notes), the act of consolidating
+  flattens their original evidence markers unless each claim is re-checked
+  against its source before being merged into prose that reads uniformly
+  confident.

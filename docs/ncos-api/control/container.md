@@ -180,7 +180,7 @@ Log entry format: `[timestamp, facility, level, message, null]`
 Common log patterns:
 - `"Trying to pull IMAGE from https://registry-1.docker.io v2"` — pull starting
 - `"Project NAME pull failure"` — image pull failed (wrong arch, tag not found, etc.)
-- `"No matching registry auth information for url ..."` — registry auth issue (usually harmless for Docker Hub public images)
+- `"No matching registry auth information for url ..."` — logged on **every** anonymous pull, including successful ones against public images. This line by itself is not diagnostic. Look at the lines immediately after it: a pull against a public image continues normally, while a pull against a private or nonexistent repository follows with `unauthorized: authentication required` and `denied: requested access to the resource is denied`. Docker Hub returns that same "denied" pair for both a private repo and a typo'd/nonexistent one, so it does not distinguish the two — confirm which by trying an anonymous `docker pull` of the same `namespace/repo:tag` from a workstation.
 
 ---
 
@@ -341,7 +341,7 @@ sshpass -p 'pass' ssh admin@ROUTER_IP "container logs PROJECT_SERVICE_1"
 
 Common causes:
 - **"manifest unknown"** — image tag doesn't exist for the target architecture
-- **"No matching registry auth"** — usually harmless for public images
+- **"No matching registry auth" followed by `unauthorized: authentication required` / `denied: requested access to the resource is denied`** — Docker Hub returns this exact pair for at least three different causes, and the error text does not distinguish them: (1) the `image:` name/tag in the compose YAML does not character-for-character match what was pushed (check this first — `gps-logger` vs `gps_logger` is enough to trigger it, and it is the most common cause in practice, more common than an actual permissions problem), (2) the repository is private (Docker Hub repos default to private on creation), or (3) the repository or tag simply does not exist. The "No matching registry auth" line alone appears on every anonymous pull, including successful ones, and does not indicate a problem by itself — it's the `unauthorized`/`denied` pair right after it that means the pull was rejected. Rule out (1) with a direct string comparison of the pushed tag against the compose `image:` value before investigating (2) or (3); fix (2)/(3) by making the repo public, correcting the name, or adding credentials to `config/container/registry` (see `docs/ncos-api/config/container.md`)
 - **Timeout** — router has limited bandwidth, large images take time
 
 Check architecture compatibility:

@@ -1,0 +1,16 @@
+version: '2.4'
+services:
+  gps_logger:
+    image: 'yourregistry/ncos_gps_logger:latest'
+    # Explicit, so `container logs gps_logger` is predictable. Without it
+    # compose derives a name from the project and service.
+    container_name: gps_logger
+    network_mode: bridge
+    volumes:
+      # Required for cp.py. Without it every Config Store read returns None,
+      # and this container has nothing else to do.
+      - $CONFIG_STORE
+    mem_limit: 32M
+    restart: unless-stopped
+    logging:
+      driver: json-file

@@ -197,30 +197,6 @@ are threads inside the Python process, and `/health` also opens a socket to
 gpsd. A two-process container needs this, otherwise gpsd can die while the
 container still reports healthy.
 
-## Verified Before Deployment
-
-Everything below was run on a development machine, with no router involved:
-
-- Both architectures build (58.0 MB arm64, 45.5 MB arm/v7).
-- Config parsing, runtime updates, DMS conversion, staleness downgrade, NMEA
-  checksums, history recording rules and the whole HTTP API, against a mock
-  `AF_UNIX` Config Store.
-- **NMEA validated against the real consumer.** gpsd 3.25 attaches to the
-  loopback feed and reports `mode: 1` with no lock, which is what the synthesized
-  `RMC` status V and `GGA` quality 0 are supposed to mean. A checksum test alone
-  would not have shown that.
-- The no-Config-Store path, which is exactly what a missing `$CONFIG_STORE`
-  volume looks like: `/api/status` reports `config_store_ok: false`, the UI shows
-  a banner, and the log names the missing volume rather than looking like a
-  receiver that never gets a fix.
-- `/health` returns 503 and names the failing component when gpsd is down.
-- Static file traversal attempts (`/static/../../../etc/passwd`) return 404.
-- `docker stop` returns well inside its timeout, so SIGTERM is handled by the
-  supervisor rather than escalating to SIGKILL, and both children exit cleanly.
-
-Not verifiable without a router: real GPS fixes, and NCM appdata round-trips
-through an actual Config Store.
-
 ## Troubleshooting
 
 | Symptom | Cause |

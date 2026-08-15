@@ -7,6 +7,10 @@ standard library only — no `requests`, no HTTP fallback.
 The canonical copy lives at the repository root. Each sample keeps an identical
 copy because a Docker build cannot reach outside its build context.
 
+Building a client in a different language? Don't reverse-engineer this module
+— [cs-sock-protocol.md](cs-sock-protocol.md) specifies the wire protocol
+directly, independent of Python.
+
 For the API paths themselves — what to read and write — see [ncos-api/](ncos-api/).
 This document covers the module, not the router's data model.
 
@@ -189,6 +193,17 @@ return `False` on timeout rather than raising.
 | `wait_for_ntp(timeout=300, check_interval=1)` | Clock is NTP synchronised |
 | `wait_for_wan_connection(timeout=300, check_interval=1)` | A WAN reports connected |
 
+**None of these can be interrupted by a shutdown signal.** They take no stop
+flag or event, so a SIGTERM arriving while one is waiting is not acted on until
+the function's own `timeout` (300s by default) elapses on its own. A signal
+handler running does not make a blocked `time.sleep()` call return early — see
+the note under "Signal Handling in Polling Loops" below, which applies to these
+functions for the same reason. If a container calls one of these at startup and
+needs `docker stop` to return promptly during that wait (worth testing
+deliberately, since it is a real startup window), write a stop-aware version
+that checks a flag between short sleeps instead of calling the library function
+directly.
+
 ## Convenience Wrappers
 
 Thin helpers over paths that are awkward enough to be worth wrapping. Everything
@@ -233,15 +248,74 @@ There is also no HTTP/REST transport for driving a remote router from a
 workstation. Use [ncos-api/explore_status.py](ncos-api/explore_status.py), curl,
 or the SSH CLI.
 
+## Signal Handling in Polling Loops
+
+A signal handler running does **not** make a blocked `time.sleep()` call return
+early. Python retries the underlying syscall to honor the full requested
+duration (PEP 475) unless the handler itself raises, so `signal.signal(SIGTERM,
+handler); time.sleep(300)` still sleeps the full 300 seconds even though the
+handler ran the instant the signal arrived — confirmed by timing it directly.
+The same applies to `wait_for_uptime()` and the other readiness functions above,
+none of which take a stop flag.
+
+The practical effect: a poller that does `while True: ...; time.sleep(interval)`
+with only a flag-setting handler will not exit until the *next* iteration after
+the current sleep finishes, and any startup call to a `wait_for_*` function
+delays shutdown by up to its own `timeout`. For a long interval or the default
+300s readiness timeout, `docker stop` will wait out the full container stop
+grace period and then be `SIGKILL`ed — indistinguishable from a broken
+entrypoint unless you know to check for this specifically.
+
+Sleep in short steps and check the flag between them instead of one long sleep:
+
+```python
+_stop = False
+
+def _handle_signal(signum, _frame):
+    global _stop
+    _stop = True
+
+def _sleep_interruptibly(seconds):
+    remaining = seconds
+    while remaining > 0 and not _stop:
+        step = min(1.0, remaining)
+        time.sleep(step)
+        remaining -= step
+```
+
+Apply the same pattern to any startup call to `wait_for_uptime()` or the other
+readiness functions if the container needs to shut down promptly during that
+window — write a local stop-aware loop rather than calling the library
+function directly, since it has no way to be interrupted.
+
 ## Usage Pattern
 
 ```python
 import cp
+import signal
+import time
+
+_stop = False
+
+def _handle_signal(signum, _frame):
+    global _stop
+    _stop = True
+
+def _sleep_interruptibly(seconds):
+    remaining = seconds
+    while remaining > 0 and not _stop:
+        step = min(1.0, remaining)
+        time.sleep(step)
+        remaining -= step
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
 
 if not cp.config_store_available():
     cp.log(f'config store unavailable: {cp.config_store_status()}')
 
-cp.wait_for_uptime(60)
+cp.wait_for_uptime(60)   # see "Signal Handling in Polling Loops" above if this
+                         # container needs to shut down promptly during startup
 
 interval = cp.get_appdata('poll_interval')
 if interval is None:
@@ -253,10 +327,10 @@ except (TypeError, ValueError):
     cp.log(f'poll_interval={interval!r} is not a number, using 1.0')
     interval = 1.0
 
-while True:
+while not _stop:
     system = cp.get('status/system') or {}
     cpu = system.get('cpu', {})
     cp.log(f"cpu={(cpu.get('user', 0) + cpu.get('system', 0)) * 100:.1f}% "
            f"temp={system.get('temperature')}C")
-    time.sleep(interval)
+    _sleep_interruptibly(interval)
 ```

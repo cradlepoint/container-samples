@@ -8,7 +8,13 @@
 
 ---
 
-Container runtime status (Docker/balena). Top-level keys are container names.
+Container runtime status. The on-router engine is `cpdockerengine` (historically
+balena-derived; whether that is still true on current firmware is
+unconfirmed — treat the underlying engine as an implementation detail rather
+than something to depend on). It presents no Docker API or socket, only the
+CLI (`container list`/`logs`/`exec`, no REST equivalent — see
+`docs/ncos-api/config/container.md`) and this status path. Top-level keys here
+are container names.
 
 ### Structure
 
