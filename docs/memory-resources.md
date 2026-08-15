@@ -51,6 +51,23 @@ put/config/security/ips/mode "off"
 
 Reboot the router after disabling.
 
+## Measured Image Size Reference
+
+Useful for planning against the memory floor and the 6 GB flash on the smallest
+models. Measured with `docker image ls` on Alpine 3.18 containing `python3`, one
+small network daemon and its client tools, plus `cp.py` and application source:
+
+| Platform | Image size | Installed packages |
+|----------|-----------|--------------------|
+| `linux/arm64` | 58.1 MB | 59 MiB (34 packages) |
+| `linux/arm/v7` | 45.6 MB | 47 MiB (34 packages) |
+
+An Alpine plus Python container of this shape runs comfortably under a
+`mem_limit` of 64 MB. Treat these as a baseline: adding compiled Python wheels
+(numpy, opencv, tflite) moves an image into the hundreds of megabytes, which is
+what makes the AER2200 and IBR1700 floor of 135 MB the real constraint for
+heavier workloads.
+
 ## Key Takeaways for Container Development
 
 - **AER2200/IBR1700**: Very constrained (135-460 MB). Use minimal base images (Alpine). Avoid heavy runtimes.

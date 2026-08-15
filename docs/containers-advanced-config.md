@@ -144,13 +144,38 @@ Health checks monitor container applications and restart on failure.
 
 ### Example Health Check
 
+Exec form (`CMD`) passes arguments directly to the binary — no shell is involved, so `||`, `&&`, pipes, and redirects are passed as literal arguments and will not work:
+
 ```yaml
 services:
   web:
     image: my-web-app
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost", "||", "exit", "1"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
 ```
+
+If the test needs shell operators, use `CMD-SHELL`, which runs the string through the container's shell (`ash` on Alpine):
+
+```yaml
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+```
+
+Whichever form is used, the test binary must exist inside the image. `curl` is not in `alpine:latest` by default — either `apk add --no-cache curl` in the Dockerfile or use a check built from tools the image already has.
+
+### Escaping `$` in Compose Values
+
+The platform performs variable interpolation on Compose values — that is how `$CONFIG_STORE` and `$USB_STORAGE` are resolved. Any other `$` in a value is also treated as a variable reference and will expand to an empty string. Escape a literal `$` by doubling it:
+
+```yaml
+    # Literal value "P@ss$word" -- without doubling, $word expands to nothing
+    environment:
+      - APP_SECRET=P@ss$$word
+    # $HOSTNAME must reach the container's shell unexpanded
+    command: ["sh", "-c", "exec /usr/sbin/mydaemon --pidfile /run/$$HOSTNAME.pid"]
+```
+
+This applies to every Compose field, not just `healthcheck` — `command`, `environment`, and `entrypoint` are the common places it bites. Secrets and passwords containing `$` are the most damaging case, because the value is silently truncated rather than erroring out.

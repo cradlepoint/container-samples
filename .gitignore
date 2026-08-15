@@ -1,3 +1,19 @@
 .DS_Store
 .idea
 .vscode
+
+# Development router credentials. Real values must never be committed.
+# Copy .env.example to .env and fill it in locally.
+.env
+.env.*
+!.env.example
+
+# Other common secret shapes, ignored pre-emptively so a stray file cannot be
+# committed by a careless `git add`.
+*.pem
+*.key
+*_rsa
+*_ed25519
+
+__pycache__/
+*.pyc

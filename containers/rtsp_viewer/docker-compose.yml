@@ -1,0 +1,28 @@
+services:
+  rtsp-viewer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/arm64
+    platform: linux/arm64
+    container_name: rtsp-viewer
+    restart: unless-stopped
+    ports:
+      - "1984:1984"       # Web UI / HTTP API
+      - "8554:8554"       # RTSP relay (optional)
+      - "8555:8555/tcp"   # WebRTC signaling/data
+      - "8555:8555/udp"   # WebRTC media
+    volumes:
+      - ./go2rtc.yaml:/config/go2rtc.yaml:ro
+    mem_limit: 128M
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:1984/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

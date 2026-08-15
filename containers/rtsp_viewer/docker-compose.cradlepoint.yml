@@ -1,0 +1,54 @@
+# Cradlepoint NCOS Compose for rtsp-viewer (go2rtc)
+#
+# Build this sample's own Dockerfile and push it to a registry the router can
+# reach -- do not point `image:` at a third party's Docker Hub repository.
+# NCOS pulls whatever `image:` names with no way to pin a digest in the
+# Compose Builder UI, so a project depending on someone else's tag is at the
+# mercy of that account, not this repo:
+#
+#   docker buildx build --platform linux/arm64 -t yourregistry/rtsp-viewer:latest --push .
+#   docker buildx build --platform linux/arm/v7 -t yourregistry/rtsp-viewer:latest-armv7 --push .
+#
+# Paste this file's contents into: System > Containers > Projects > Add >
+# Compose tab, on the router (or group) in NetCloud Manager, after replacing
+# the image below.
+version: "2.4"
+services:
+  rtsp-viewer:
+    image: "yourregistry/rtsp-viewer:latest"
+    container_name: rtsp-viewer
+    restart: unless-stopped
+    ports:
+      # NOTE: mapped ports on NCOS are reachable on WAN as well as LAN, and
+      # the router firewall does not filter them. This stream is a live feed
+      # of a physical camera, so set API_USERNAME/PASSWORD and
+      # RTSP_USERNAME/PASSWORD below, or attach this service to a Local IP
+      # Network instead of publishing ports at all (see README).
+      - "1984:1984"       # Web UI / HTTP API
+      - "8554:8554"       # RTSP relay (optional)
+      - "8555:8555/tcp"   # WebRTC signaling/data
+      - "8555:8555/udp"   # WebRTC media
+    environment:
+      # Add one CAMERA<n>_URL / CAMERA<n>_NAME pair per camera (n = 1..20).
+      - CAMERA1_NAME=frontdoor
+      - CAMERA1_URL=rtsp://username:password@192.168.1.100:554/stream1
+      # - CAMERA2_NAME=backyard
+      # - CAMERA2_URL=rtsp://username:password@192.168.1.101:554/stream1
+      #
+      # go2rtc's WebRTC module needs to know its own reachable address to
+      # negotiate media correctly since it's behind the router's Docker
+      # NAT. Set this to the router's LAN IP and the mapped port above.
+      - WEBRTC_CANDIDATE=192.168.1.1:8555
+      #
+      # Basic auth for the published ports. go2rtc always skips auth for
+      # calls it sees as coming from localhost, so this only protects the
+      # service once it's reachable from the network -- which on NCOS means
+      # WAN too. Leave unset only if this is bound to a private Local IP
+      # Network instead of published via ports:.
+      - API_USERNAME=admin
+      - API_PASSWORD=change-me
+      - RTSP_USERNAME=admin
+      - RTSP_PASSWORD=change-me
+    mem_limit: 128M
+    logging:
+      driver: json-file

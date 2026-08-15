@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>NCOS gpsd Server</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+
+<body>
+    <header>
+        <h1>NCOS gpsd Server</h1>
+        <span class="status-pill"><span class="dot" id="fixDot"></span><span id="fixLabel">Connecting</span></span>
+        <span class="status-pill"><span class="dot" id="gpsdDot"></span><span id="gpsdLabel">gpsd</span></span>
+        <span class="spacer"></span>
+        <span class="status-pill">Uptime <span id="uptime">--</span></span>
+    </header>
+
+    <main>
+        <div id="map">
+            <div id="tiles"></div>
+            <canvas id="overlay"></canvas>
+            <div class="map-controls">
+                <button class="icon" id="zoomIn" title="Zoom in" aria-label="Zoom in">+</button>
+                <button class="icon" id="zoomOut" title="Zoom out" aria-label="Zoom out">&minus;</button>
+                <button class="icon" id="followToggle" title="Follow current position"
+                    aria-label="Follow current position">F</button>
+            </div>
+            <p class="map-note" id="mapNote" hidden>
+                Map tiles could not be loaded. The browser fetches them from the internet through the
+                router, so this usually means no WAN connectivity or a blocked tile server. The grid,
+                track and position marker still work without a basemap.
+            </p>
+            <div class="attribution">Tiles &copy; OpenStreetMap contributors</div>
+        </div>
+
+        <aside>
+            <div class="banner" id="banner" hidden></div>
+
+            <section>
+                <h2>Current position</h2>
+                <dl class="readout">
+                    <dt>Latitude</dt>
+                    <dd id="lat">--</dd>
+                    <dt>Longitude</dt>
+                    <dd id="lon">--</dd>
+                    <dt>Altitude</dt>
+                    <dd id="alt">--</dd>
+                    <dt>Speed</dt>
+                    <dd id="speed">--</dd>
+                    <dt>Heading</dt>
+                    <dd id="heading">--</dd>
+                    <dt>Satellites</dt>
+                    <dd id="sats">--</dd>
+                    <dt>Accuracy</dt>
+                    <dd id="accuracy">--</dd>
+                    <dt>Fix age</dt>
+                    <dd id="age">--</dd>
+                </dl>
+                <p class="hint" id="fixState">Waiting for status</p>
+            </section>
+
+            <section>
+                <h2>History</h2>
+                <dl class="readout">
+                    <dt>Points</dt>
+                    <dd id="trackPoints">--</dd>
+                    <dt>Stored in</dt>
+                    <dd id="trackPersist">--</dd>
+                    <dt>NMEA clients</dt>
+                    <dd id="nmeaClients">--</dd>
+                </dl>
+                <div class="row" style="margin-top: 8px;">
+                    <button id="clearHistory" class="danger">Clear history</button>
+                </div>
+            </section>
+
+            <section>
+                <h2>Settings</h2>
+                <label class="field">Poll interval (s)
+                    <input type="number" id="pollInterval" min="0.2" max="60" step="0.1">
+                </label>
+                <label class="field">Stale after (s)
+                    <input type="number" id="staleAfter" min="1" max="3600" step="1">
+                </label>
+                <label class="field">Tile URL
+                    <input type="text" id="tileUrl" placeholder="blank to disable basemap">
+                </label>
+                <div class="row">
+                    <button id="saveSettings" class="primary">Save settings</button>
+                </div>
+                <p class="hint">Saved to NCOS appdata and applied immediately. Ports are configured in
+                    appdata but need a container restart.</p>
+            </section>
+        </aside>
+    </main>
+
+    <script src="/static/js/map.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+
+</html>

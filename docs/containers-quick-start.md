@@ -72,6 +72,24 @@ After committing, the router automatically:
 - Downloads and installs the container runtime
 - Pulls the container image(s)
 
+### Deploying Without the UI
+
+The compose YAML is stored as a plain string in `config/container/projects`, so a
+project can also be created and updated over REST or the SDK — no UI clicking per
+iteration. This is the faster loop when developing against a test router. See
+[ncos-api/config/container.md](ncos-api/config/container.md).
+
+### Before Debugging a Failed Deployment
+
+Confirm the entitlement is actually present rather than assuming, since
+Container Orchestration is licensed separately:
+
+```python
+features = cp.get('status/feature')   # or GET /api/status/feature
+# db entries are [uuid, name, expires_days, remaining_days];
+# look for "Container Orchestration"
+```
+
 ## Configuring a Container Registry
 
 By default, images are pulled from Docker Hub. To use a different registry:
@@ -128,6 +146,33 @@ mv main_copy.py main.py
 
 ## FAQ
 
+- **Project appears in `container list` with no containers under it?** This one
+  symptom has three different causes, and they are distinguishable. Note first
+  that `container list` itself reads project *config*, so it answers normally
+  even when the engine is dead — its output is not evidence the engine is alive.
+
+  | `status/container` | `containers` lines in `status/log` | Diagnosis |
+  |--------------------|-----------------------------------|-----------|
+  | Returns data | Present, active | Image pull still in progress |
+  | **Hangs / times out** | Present, with `daemon is not responding ... DeadlineExceeded` | Engine wedged. A reboot clears it |
+  | **Returns `null` promptly** | **None at all** | Engine not running. Nothing is even attempting the pull |
+
+  Absence of log lines from a facility is a positive signal, not a lack of
+  information: count facilities in `status/log` to see which subsystems are
+  alive. Check all of this before re-reading your own compose file — when the
+  platform is the variable, debugging your artifact wastes time.
+
+  Also note the engine logs `High system CPU load?` as a *guess* whenever a call
+  times out. Verify against `status/system` (`cpu`, `load_avg`, `memory`) before
+  treating load as the cause, because that message appears on an idle router.
+
+- **Container subsystem missing after a firmware upgrade?** Project config in
+  `config/container/projects` and the `status/feature` entitlement can both
+  survive an upgrade while the engine does not come back. Verify the subsystem is
+  alive before concluding your deployment is at fault. (Cause UNVERIFIED. The
+  account-level toggle under Tools > Container Orchestration, which triggers the
+  runtime download, is the first thing worth re-checking, but this has not been
+  confirmed as the fix.)
 - **Can Docker volumes be pruned?** No, volumes on routers cannot be pruned.
 - **User namespace remapping?** Yes, user namespace remapping is employed. See file ownership caveat above.
 - **Volume not updated with new image?** Volumes are not updated from new images. Create a new project to get a fresh volume.

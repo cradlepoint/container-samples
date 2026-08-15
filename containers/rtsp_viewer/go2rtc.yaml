@@ -1,0 +1,23 @@
+streams:
+  # Replace with your camera's actual RTSP URL. You can add as many
+  # cameras as you want, each as its own "name: url" entry.
+  camera1: rtsp://username:password@192.168.1.100:554/stream1
+
+api:
+  # Web UI + HTTP API, reachable at http://<host>:1984/
+  listen: ":1984"
+  # Uncomment to require Basic auth. go2rtc always skips it for calls it
+  # treats as coming from localhost, so this only matters once the port is
+  # reachable from the network -- see the Security section in README.md.
+  # username: "admin"
+  # password: "change-me"
+
+rtsp:
+  # Local RTSP relay/re-publish, not required for the web UI to work.
+  listen: ":8554"
+  # username: "admin"
+  # password: "change-me"
+
+webrtc:
+  # Used for low-latency browser playback.
+  listen: ":8555"

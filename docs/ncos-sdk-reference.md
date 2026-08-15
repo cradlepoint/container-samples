@@ -1,177 +1,262 @@
-# NCOS SDK Reference (cp.py)
+# cp.py Reference
 
-This is a reference for the `cp.py` module used inside containers to communicate with the Cradlepoint router's Config Store via the Unix domain socket `/var/tmp/cs.sock`.
+`cp.py` is a minimal client for the router's Config Store, for use inside
+containers. It talks to the Unix socket at `/var/tmp/cs.sock` and uses the
+standard library only — no `requests`, no HTTP fallback.
+
+The canonical copy lives at the repository root. Each sample keeps an identical
+copy because a Docker build cannot reach outside its build context.
+
+For the API paths themselves — what to read and write — see [ncos-api/](ncos-api/).
+This document covers the module, not the router's data model.
 
 ## Setup
 
-To use `cp.py` in a container:
-
-1. Copy `cp.py` into the container image
-2. Mount the Config Store socket by enabling the "Config Store" volume option in the container project
-3. Set `PYTHONPATH` to include the directory containing `cp.py`
-
-### Dockerfile Example
-
 ```dockerfile
 FROM alpine:3.18
-RUN apk add --no-cache python3 py3-requests
+RUN apk add --no-cache python3
 COPY cp.py /opt/app/cp.py
 ENV PYTHONPATH=/opt/app
 ```
-
-### Compose Volume for Config Store
-
-In the Compose Builder, under Volumes & Devices, enable the **Config Store** option. This exposes `cs.sock` at `/var/tmp/cs.sock` inside the container.
-
-In raw Compose YAML, use the `$CONFIG_STORE` variable:
 
 ```yaml
 services:
   my_service:
     volumes:
-      - $CONFIG_STORE
+      - $CONFIG_STORE      # bare, no mount target
 ```
 
-The platform resolves `$CONFIG_STORE` automatically — do not append a mount target path.
+Without the `$CONFIG_STORE` volume there is no socket, and every accessor
+returns `None`.
 
-## Core Functions
+Check connectivity from a shell in the container:
 
-### Config Store Access
+```bash
+python3 /opt/app/cp.py                      # prints status/product_info
+python3 /opt/app/cp.py status/gps/fix       # or any path
+```
 
-| Function | Description |
-|----------|-------------|
-| `cp.get(path, query='', tree=0)` | GET data from the router config/status tree |
-| `cp.put(path, value='', query='', tree=0)` | PUT (update) data in the router tree |
-| `cp.post(path, value='', query='')` | POST (create) data in the router tree |
-| `cp.delete(path, query='')` | DELETE data from the router tree |
-| `cp.decrypt(path, query='', tree=0)` | GET and decrypt encrypted data (NCOS only) |
+## Core Access
 
-### Logging and Alerts
+| Function | Returns |
+|----------|---------|
+| `get(path, query='', tree=0)` | The data itself, or `None` |
+| `decrypt(path, query='', tree=0)` | Decrypted data, or `None` |
+| `put(path, value='', query='', tree=0)` | `{'status': str, 'data': Any}`, or `None` if unreachable |
+| `post(path, value='', query='')` | Same as `put()` |
+| `delete(path, query='')` | Same as `put()` |
+| `log(value)` | `None`. Writes to stdout, collected by `container logs` |
+| `alert(value, name=None)` | `True` if the router accepted a custom alert for NCM |
 
-| Function | Description |
-|----------|-------------|
-| `cp.log(value='')` | Write to syslog (NCOS) or stdout (container) or console (dev) |
-| `cp.alert(value='')` | Send a custom alert to NCM (NCOS only) |
+**Responses are unwrapped.** `cp.get('status/system')` returns the system dict
+directly. Never write `cp.get(...).get('data')`.
 
-### AppData (Container Configuration)
+```python
+import cp
 
-AppData is the mechanism for passing configuration values from NetCloud Manager to a container at runtime.
+state = cp.get('status/wan/connection_state')   # 'connected'
+cp.put('config/system/gps/enabled', True)
+cp.post('config/wan/rules2/', new_rule)
+cp.log(f'WAN is {state}')
+```
 
-| Function | Description |
-|----------|-------------|
-| `cp.get_appdata(name='')` | Get appdata value by name, or all appdata if no name |
-| `cp.put_appdata(name='', value='')` | Update an appdata value |
-| `cp.post_appdata(name='', value='')` | Create a new appdata entry |
-| `cp.delete_appdata(name='')` | Delete an appdata entry |
+### Log Prefix and APP_NAME
 
-### Device Information
+`log()` prefixes every line with `APP_NAME`, which is resolved once at import:
 
-| Function | Description |
-|----------|-------------|
-| `cp.get_mac(format_with_colons=False)` | Get device MAC address |
-| `cp.get_serial_number()` | Get device serial number |
-| `cp.get_product_type()` | Get device product type |
-| `cp.get_name()` | Get device name |
-| `cp.get_firmware_version(include_build_info=False)` | Get firmware version string |
-| `cp.get_router_model()` | Get router model from product name |
-| `cp.get_uptime()` | Get router uptime in seconds |
+```python
+APP_NAME = os.environ.get('CP_APP_NAME') or os.path.basename(os.getcwd()) or 'container'
+```
 
-### Network and WAN
+An image with no `WORKDIR` runs at `/`, where `basename` is empty, so every line
+falls back to the generic `container:` — unhelpful the moment two services log to
+the same place. **Set it explicitly in the Dockerfile:**
 
-| Function | Description |
-|----------|-------------|
-| `cp.get_connected_wans(max_retries=10)` | List connected WAN UIDs |
-| `cp.get_sims(max_retries=10)` | List modem UIDs with SIMs |
-| `cp.get_wan_status()` | Detailed WAN status |
-| `cp.get_ipv4_wired_clients()` | List IPv4 wired clients |
-| `cp.get_ipv4_wifi_clients()` | List IPv4 Wi-Fi clients |
-| `cp.get_ipv4_lan_clients()` | All IPv4 clients (wired + Wi-Fi) |
+```dockerfile
+ENV CP_APP_NAME=my_service
+```
 
-### GPS and Location
+This matters beyond cosmetics wherever `APP_NAME` is used as protocol data rather
+than just a prefix, because the payload would otherwise depend on the working
+directory. `alert()` sends it as a field, for instance.
 
-| Function | Description |
-|----------|-------------|
-| `cp.get_lat_long(max_retries=5, retry_delay=0.1)` | Get latitude/longitude as floats |
-| `cp.get_gps_status()` | Detailed GPS status |
-| `cp.dec(deg, min=0.0, sec=0.0)` | Convert DMS to decimal degrees |
+## Error Handling Contract
 
-### System Status
+Accessors do not raise. A read failure and an absent path both produce `None`,
+so a long-running poller survives a transient socket problem — but it also means
+`None` alone does not tell you what went wrong.
 
-| Function | Description |
-|----------|-------------|
-| `cp.get_system_status()` | System status details |
-| `cp.get_wlan_status()` | WLAN status details |
-| `cp.get_ncm_status(include_details=False)` | NCM connection status |
-| `cp.get_gpio(gpio_name=None, router_model=None)` | Read GPIO state |
-| `cp.get_all_gpios(router_model=None)` | Raw GPIO structure |
-| `cp.get_available_gpios(router_model=None)` | List available GPIO names |
+### Distinguish "no Config Store" from "no data"
 
-### Startup Helpers
+```python
+if not cp.config_store_available():
+    cp.log(cp.config_store_status())    # includes last_error and socket_exists
+```
 
-| Function | Description |
-|----------|-------------|
-| `cp.wait_for_uptime(min_uptime_seconds=60)` | Block until router uptime exceeds threshold |
-| `cp.wait_for_ntp(timeout=300, check_interval=1)` | Block until NTP is synchronized |
-| `cp.wait_for_wan_connection(timeout=300)` | Block until a WAN connection is active |
+| Function | Purpose |
+|----------|---------|
+| `config_store_available()` | `True` when the socket is reachable. Probes once, then uses cached transport state |
+| `config_store_status()` | Dict: `available`, `socket_path`, `socket_exists`, `last_error`, `failures`, `successes` |
+| `last_transport_error()` | Text of the most recent transport failure, or `None` |
 
-### Event Registration
+Surface this in any status endpoint or UI. A missing `$CONFIG_STORE` volume
+otherwise looks exactly like a router with nothing to report, and re-probing
+periodically means a socket that appears later is picked up without a restart.
 
-| Function | Description |
-|----------|-------------|
-| `cp.register(action, path, callback, *args)` | Register callback for config store events |
-| `cp.on(action, path, callback, *args)` | Alias for `register` |
-| `cp.unregister(eid)` | Unregister a callback by event ID |
+Repeated failures are logged once and then throttled, so a missing volume does
+not emit one line per poll forever.
 
-### Security and Certificates
+### Writes
 
-| Function | Description |
-|----------|-------------|
-| `cp.get_ncm_api_keys()` | Get NCM API keys from certificate config |
-| `cp.extract_cert_and_key(cert_name_or_uuid='')` | Extract cert and key to filesystem |
+`put()`, `post()` and `delete()` return the Config Store's response, but the
+exact success string in `status` is firmware dependent. Where a write matters,
+confirm it by reading the value back. The appdata helpers already do this.
 
-### Device Control
+Before writing to a `config/...` path, read it first: `None` means the path does
+not exist on this firmware or model, and writing blindly into an unknown tree
+does nothing detectable.
 
-| Function | Description |
-|----------|-------------|
-| `cp.reboot_device(force=False)` | Reboot the router |
+Confirm the field's type and meaning in the DTD before writing it, rather than
+inferring either from example code. Field semantics are per-path and the same
+name can mean opposite things in different sections — see
+[ncos-api/dtd-usage.md](ncos-api/dtd-usage.md).
 
-## Common Config/Status Paths
+## NCM Custom Alerts
 
-These are frequently used paths with `cp.get()`:
+`alert()` works from a container with only the `$CONFIG_STORE` volume — no SDK
+application registration. Verified end-to-end: sent from a container, appeared in
+the NCM console as a `Custom Alert` row against the correct device (R980,
+NCOS 7.26.21).
 
-| Path | Returns |
-|------|---------|
-| `status/product_info` | Product info (model, MAC, etc.) |
-| `status/fw_info` | Firmware version details |
-| `status/system` | System status |
-| `status/wan/devices` | WAN device status and stats |
-| `status/lan` | LAN status and stats |
-| `status/lan/clients` | Connected LAN clients |
-| `status/ethernet` | Ethernet port status |
-| `status/gps` | GPS data |
-| `config/system/snmp` | SNMP configuration |
-| `config/system/system_id` | System identifier |
-| `config/vlan` | VLAN configuration |
+```python
+cp.alert(f'tank level critical: {level}%')   # True if the router accepted it
+```
+
+| Behaviour | Detail |
+|-----------|--------|
+| Return | `True` only when the router accepted it. `False` on an empty value, a rejection, or no Config Store |
+| `name` | Defaults to `APP_NAME`. Sent because the protocol requires the field, but **NCM does not display it** — put anything you need to see in `value` |
+| Empty value | Refused, and nothing is sent. An empty value still creates an alert on the router, but NCM shows the placeholder `Router NCOS App Generated Alert` with no detail |
+| Newlines / tabs | Collapsed to spaces. The protocol is newline-delimited, so unsanitised text would inject protocol fields |
+| Non-ASCII | Replaced. Commands are ASCII-encoded; UTF-8 support is untested |
+| Length | Truncated at 1024 characters with an ellipsis. The real ceiling is unknown |
+| Latency | Alerts sync rather than stream; allow up to a few minutes |
+
+Alerts are a shared, rate-limited, human-facing channel. Send transitions and
+exceptions, not periodic samples, and debounce anything derived from a noisy
+signal or the console fills with duplicates.
+
+## Application Configuration (appdata)
+
+Appdata is how settings reach a container from NCM (System > SDK Data). Values
+are always strings — parse and validate them with defaults.
+
+| Function | Returns |
+|----------|---------|
+| `get_appdata(name='')` | The value as a string, or the full list of entries when no name is given. `None` if unset |
+| `put_appdata(name, value)` | `True` only if verified by read-back. Creates the field if absent |
+| `post_appdata(name, value)` | `True` if verified by read-back |
+| `delete_appdata(name)` | `True` if the field is gone afterwards |
+
+```python
+interval = cp.get_appdata('poll_interval')
+if interval is None:
+    cp.put_appdata('poll_interval', '1.0')      # self-provision on first run
+```
+
+Name matching in `get_appdata()` is case-insensitive.
+
+## Device Identity
+
+| Function | Returns |
+|----------|---------|
+| `get_product_name()` | Model, e.g. `'R1900'` |
+| `get_router_model()` | Alias for `get_product_name()` |
+| `get_mac()` | Primary MAC |
+| `get_serial_number()` | Chassis serial |
+| `get_firmware_version(include_build_info=False)` | e.g. `'7.25.20'` |
+| `get_name()` | Hostname / system id |
+| `get_uptime()` | Seconds since boot, as a float |
+
+## Readiness
+
+Router services are still settling in the first minute after boot. All three
+return `False` on timeout rather than raising.
+
+| Function | Blocks until |
+|----------|--------------|
+| `wait_for_uptime(min_uptime_seconds=60, timeout=300)` | Uptime exceeds the threshold |
+| `wait_for_ntp(timeout=300, check_interval=1)` | Clock is NTP synchronised |
+| `wait_for_wan_connection(timeout=300, check_interval=1)` | A WAN reports connected |
+
+## Convenience Wrappers
+
+Thin helpers over paths that are awkward enough to be worth wrapping. Everything
+else is a plain `get()`.
+
+| Function | Returns |
+|----------|---------|
+| `get_connected_wans()` | UIDs of connected WAN devices. Useful for store-and-forward |
+| `get_sims()` | UIDs of modems with a SIM, e.g. `['mdm-abcd1234']`. Strings, not dicts. Excludes NOSIM |
+| `get_wan_profiles()` | `config/wan/rules2` as a list, sorted ascending by priority (most preferred first) |
+| `get_gpio(name=None, router_model=None)` | GPIO by logical name, mapped to this model's raw key |
+| `get_lat_long()` | `(latitude, longitude)` in signed decimal degrees, or `(None, None)` |
+| `dec(degree, minute=0, second=0)` | DMS to signed decimal degrees |
+| `validate_password(username, password)` | `{'valid': bool}` or `{'valid': False, 'error': str}` |
+
+Notes:
+
+- `get_lat_long()` returns `(None, None)` when there is no lock. The router
+  reports DMS with the sign on the degree component; `dec()` handles that.
+- `get_wan_profiles()` sorts ascending, which is most-preferred first: lower
+  `priority` values win for WAN failover. Update a single field with the indexed
+  path, `cp.put(f'config/wan/rules2/{rule["_id_"]}/priority', 1)` — never put the
+  whole list back. The direction of `priority` is not consistent across the NCOS
+  config tree; see [ncos-api/config/wan-rules2.md](ncos-api/config/wan-rules2.md).
+- `get_gpio()` only knows logical names for models listed in
+  [ncos-api/status/gpio.md](ncos-api/status/gpio.md). Use
+  `cp.get('status/gpio')` for raw keys on other models.
+- `validate_password()` returns an error for masked `$0$` hashes, which the REST
+  API returns and which cannot be validated. Only the on-router socket returns
+  real `$3$` hashes.
+
+## Not Available in Containers
+
+These exist as stubs that log a clear message and return `None`, so example code
+copied from elsewhere fails legibly instead of raising `AttributeError`.
+
+| Function | Status | Use instead |
+|----------|--------|-------------|
+| `register()` / `on()` / `unregister()` | Config store event subscriptions need the event socket, which is not exposed to containers | Poll with `get()` on an interval |
+
+There is also no HTTP/REST transport for driving a remote router from a
+workstation. Use [ncos-api/explore_status.py](ncos-api/explore_status.py), curl,
+or the SSH CLI.
 
 ## Usage Pattern
 
 ```python
 import cp
 
-# Wait for router to be ready
+if not cp.config_store_available():
+    cp.log(f'config store unavailable: {cp.config_store_status()}')
+
 cp.wait_for_uptime(60)
-cp.wait_for_wan_connection(timeout=120)
 
-# Read configuration
-snmp_config = cp.get('config/system/snmp') or {}
-community = snmp_config.get('get_community', 'public')
+interval = cp.get_appdata('poll_interval')
+if interval is None:
+    cp.put_appdata('poll_interval', '1.0')
+    interval = '1.0'
+try:
+    interval = max(0.2, float(interval))
+except (TypeError, ValueError):
+    cp.log(f'poll_interval={interval!r} is not a number, using 1.0')
+    interval = 1.0
 
-# Read appdata (user-configured values from NCM)
-my_setting = cp.get_appdata('my_setting') or 'default_value'
-
-# Log messages
-cp.log('Container started successfully')
-
-# Write configuration
-cp.put('config/some/path', 'new_value')
+while True:
+    system = cp.get('status/system') or {}
+    cpu = system.get('cpu', {})
+    cp.log(f"cpu={(cpu.get('user', 0) + cpu.get('system', 0)) * 100:.1f}% "
+           f"temp={system.get('temperature')}C")
+    time.sleep(interval)
 ```

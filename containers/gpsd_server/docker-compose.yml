@@ -1,0 +1,40 @@
+version: '2.4'
+services:
+  gpsd-server:
+    image: 'yourregistry/ncos-gpsd-server:latest'
+    # Explicit, so `container logs gpsd-server` is predictable. Without it
+    # compose derives a name from the project and service.
+    container_name: gpsd-server
+    network_mode: bridge
+    ports:
+      # gpsd for LAN clients, and the map UI.
+      # NOTE: mapped ports on NCOS are reachable on WAN as well as LAN, and the
+      # router firewall does not filter them. Both endpoints are unauthenticated
+      # and expose the router's physical location. On an untrusted network, drop
+      # the ports block and attach the service to a Local IP Network instead
+      # (see README).
+      - '2947:2947/tcp'
+      - '8080:8080/tcp'
+    volumes:
+      # Location history survives container restarts. Note that volume data is
+      # not refreshed when a new image is deployed.
+      - gpsd-history:/data
+      # Required for cp.py. Without it every Config Store read returns None.
+      - $CONFIG_STORE
+    mem_limit: 64M
+    restart: unless-stopped
+    healthcheck:
+      # Covers both supervised processes: the poller and NMEA listener are
+      # threads in the Python process, and /health also connects to gpsd.
+      # curl is deliberately not used -- it is not installed in the Alpine base,
+      # and python3 already is.
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+
+volumes:
+  gpsd-history:
+    driver: local
