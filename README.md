@@ -1,4 +1,4 @@
-# Running Containers on Ericsson Routers
+# Ericsson Container Samples
 
 ## Platform Overview
 
