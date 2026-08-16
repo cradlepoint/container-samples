@@ -560,6 +560,18 @@ does not exist.
 - File ownership changes to `nobody:nobody` when replacing base image files (use copy-then-move workaround)
 - Config Store access must be explicitly enabled per container
 
+### Linux Capabilities (UNVERIFIED)
+
+Beyond "no root access to NetCloud OS," this repo has no confirmed statement of
+which Linux capabilities a container actually receives — in particular whether
+`CAP_NET_RAW` (raw sockets, needed for tools like `ping`'s raw-socket mode,
+packet crafting with `trafgen`/`mausezahn`, or `tcpreplay`) is granted, dropped,
+or configurable via Compose `cap_add`/`cap_drop`. Any design that depends on
+raw sockets or other non-default capabilities should treat this as an open
+question and verify with a small probe (attempt to open a raw socket, check the
+result) before committing to a tool that needs it, rather than assuming from a
+package's documentation that it will work unprivileged inside `cpdockerengine`.
+
 ### Side Effects of User Namespace Remapping
 
 Beyond file ownership, remapping affects anything using SysV IPC. Daemons that

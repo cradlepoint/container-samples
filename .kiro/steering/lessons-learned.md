@@ -1252,3 +1252,27 @@ just-written edit had the same defect this file has repeatedly found in
   flattens their original evidence markers unless each claim is re-checked
   against its source before being merged into prose that reads uniformly
   confident.
+
+## 2026-08-16 — A capability question surfaced by scoping, not by building
+
+No container was built this session; a use-case discussion (synthetic traffic
+generation with IMIX-style packet-size distributions) surfaced a documentation
+gap worth recording on its own, since it will recur for any future sample.
+
+### "No root access" is not the same claim as "these capabilities are available"
+
+- The docs state user namespace remapping and no root access to NetCloud OS,
+  but never say which Linux capabilities (`CAP_NET_RAW` specifically, needed
+  for raw sockets, packet crafting, and some ping implementations) a container
+  receives under `cpdockerengine`, or whether Compose `cap_add`/`cap_drop` has
+  any effect there. This is a different question from root access — a
+  non-root process can still hold `CAP_NET_RAW` — and conflating the two would
+  have led to either wrongly assuming a raw-socket tool will work, or wrongly
+  ruling one out, without evidence either way.
+- Recorded as an explicit UNVERIFIED item in `docs/container-development-guide.md`
+  rather than guessed at, consistent with the standing rule in this file: when
+  a design would be shaped by a platform limitation, find the evidence before
+  building around it. A cheap probe container (attempt a raw socket, report
+  success/failure) would settle this the same way the `alert()` and
+  `cp.register()` questions were settled elsewhere in this file — worth doing
+  before, not during, a build that actually needs the answer.

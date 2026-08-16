@@ -1,5 +1,50 @@
 # Ericsson Container Samples
 
+## Getting Started
+
+Use this repo as a starting point for building your own NCOS containers with Kiro. The intended workflow is fork → clone → chat → (optionally) contribute back.
+
+### 1. Fork the repo
+
+On GitHub, fork [cradlepoint/container-samples](https://github.com/cradlepoint/container-samples) into your own account or org. Working from your own fork keeps your container code separate from this upstream repo and gives you a remote to push to.
+
+### 2. Clone your fork in Kiro
+
+Clone your fork locally, then open the folder in Kiro:
+
+```bash
+git clone https://github.com/<your-username>/container-samples.git
+cd container-samples
+```
+
+Open the cloned folder as your workspace in Kiro (File > Open Folder, or `kiro .` from the terminal). Kiro picks up the steering files in `.kiro/steering/` automatically, so it already knows the conventions, constraints, and reference samples in this repo.
+
+### 3. Chat with Kiro to build a container
+
+Describe what you want to build in the chat panel, for example:
+
+> Build a container that reads GPS position from the router and publishes it over MQTT
+
+Kiro will:
+- Read the docs in `docs/` (development guide, SDK reference, memory constraints) before writing code
+- Check whether NCOS already provides the capability natively, and ask clarifying questions about your target router model, networking, and Config Store access needs
+- Scaffold the container under `containers/<your_sample>/` following the existing conventions (Dockerfile, entrypoint script, Compose YAML, README)
+- Build and verify the image locally for both `linux/arm64` and `linux/arm/v7` before calling the work done
+
+You can iterate conversationally — ask Kiro to add features, simplify something, or point it at an existing sample (like `containers/edge_ai/`) as a pattern to follow.
+
+### 4. (Optional) Contribute back
+
+If you've built something worth sharing, open a pull request against the upstream repo:
+
+```bash
+git add containers/<your_sample>
+git commit -m "Add <your_sample> container"
+git push -u origin <your-branch-name>
+```
+
+Then open a PR from your fork's branch to `cradlepoint/container-samples` on GitHub (or use `gh pr create` from the CLI). Include what the container does, which router models/architectures you tested, and any measured image sizes in the PR description.
+
 ## Platform Overview
 
 Ericsson routers run containers on a Linux ARM64 (aarch64) platform using musl libc. Containers must be built for this target architecture and C library to function correctly.

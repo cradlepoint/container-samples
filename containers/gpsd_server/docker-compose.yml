@@ -2,8 +2,6 @@ version: '2.4'
 services:
   gpsd-server:
     image: 'yourregistry/ncos-gpsd-server:latest'
-    # Explicit, so `container logs gpsd-server` is predictable. Without it
-    # compose derives a name from the project and service.
     container_name: gpsd-server
     network_mode: bridge
     ports:
@@ -19,7 +17,6 @@ services:
       # Location history survives container restarts. Note that volume data is
       # not refreshed when a new image is deployed.
       - gpsd-history:/data
-      # Required for cp.py. Without it every Config Store read returns None.
       - $CONFIG_STORE
     mem_limit: 64M
     restart: unless-stopped
