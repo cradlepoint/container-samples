@@ -4,20 +4,24 @@
 
 Use this repo as a starting point for building your own NCOS containers with Kiro. The intended workflow is fork → clone → chat → (optionally) contribute back.
 
-### 1. Fork the repo
+### 1. Fork the repo on GitHub
 
-On GitHub, fork [cradlepoint/container-samples](https://github.com/cradlepoint/container-samples) into your own account or org. Working from your own fork keeps your container code separate from this upstream repo and gives you a remote to push to.
+1. Go to [cradlepoint/container-samples](https://github.com/cradlepoint/container-samples) on GitHub.
+2. Click **Fork** in the top-right corner.
+3. Choose your account or org as the destination and create the fork.
 
-### 2. Clone your fork in Kiro
+Working from your own fork keeps your container code separate from this upstream repo and gives you a remote to push to.
 
-Clone your fork locally, then open the folder in Kiro:
+### 2. Clone your fork with Kiro
 
-```bash
-git clone https://github.com/<your-username>/container-samples.git
-cd container-samples
-```
+Kiro can clone the repo for you, no terminal needed:
 
-Open the cloned folder as your workspace in Kiro (File > Open Folder, or `kiro .` from the terminal). Kiro picks up the steering files in `.kiro/steering/` automatically, so it already knows the conventions, constraints, and reference samples in this repo.
+1. Open the Command Palette (`Cmd+Shift+P` on macOS, `Ctrl+Shift+P` on Windows/Linux) and run **Git: Clone**.
+2. Paste your fork's URL, e.g. `https://github.com/<your-username>/container-samples.git`.
+3. Pick a local folder to clone into.
+4. When prompted, choose **Open** to open the cloned repo as your Kiro workspace.
+
+Kiro picks up the steering files in `.kiro/steering/` automatically once the workspace is open, so it already knows the conventions, constraints, and reference samples in this repo.
 
 ### 3. Chat with Kiro to build a container
 
@@ -35,15 +39,14 @@ You can iterate conversationally — ask Kiro to add features, simplify somethin
 
 ### 4. (Optional) Contribute back
 
-If you've built something worth sharing, open a pull request against the upstream repo:
+If you've built something worth sharing, use Kiro's Source Control view to commit and push, no terminal needed:
 
-```bash
-git add containers/<your_sample>
-git commit -m "Add <your_sample> container"
-git push -u origin <your-branch-name>
-```
+1. Open the Source Control view in the sidebar (or `Cmd+Shift+G` / `Ctrl+Shift+G`).
+2. Stage your new container's files (e.g. `containers/<your_sample>/`) by hovering over them and clicking the **+**, or stage everything with the **+** next to Changes.
+3. Enter a commit message (e.g. "Add `<your_sample>` container") in the message box and click the checkmark to commit.
+4. Click **Publish Branch** (for a new branch) or **Sync Changes** / **Push** to push to your fork.
 
-Then open a PR from your fork's branch to `cradlepoint/container-samples` on GitHub (or use `gh pr create` from the CLI). Include what the container does, which router models/architectures you tested, and any measured image sizes in the PR description.
+Then open a PR from your fork's branch to `cradlepoint/container-samples` on GitHub. Include what the container does, which router models/architectures you tested, and any measured image sizes in the PR description.
 
 ## Platform Overview
 
