@@ -268,6 +268,19 @@ function alert(name, value):
     return dispatch(f"alert\n{name}\n{value}\n")
 ```
 
+The pseudocode above elides timeout handling for readability, and that is the
+one place a client must not follow it literally. Both `recv` loops need the
+receive timeout, and a timeout in **either** loop has to be classified as a
+failed request per the parsing algorithm above.
+
+Worth getting right first time: `cp.py` originally handled the timeout in the
+header loop but not the body loop, and returned its synthetic `timeout` status as
+an ordinary value, so its own health counters recorded a hung Config Store as a
+successful exchange — the one failure those counters existed to catch. Fixed
+2026-08-17. Prefer a single deadline for the whole exchange over a per-`recv`
+timeout, so a backend that dribbles bytes cannot extend the request
+indefinitely.
+
 This maps directly onto sockets in most languages:
 
 - **Go:** `net.Dial("unix", "/var/tmp/cs.sock")`, then plain `net.Conn`
@@ -317,7 +330,18 @@ observation from testing against this protocol, not a hypothetical).
 ## Testing a client without a router
 
 Bind a mock `AF_UNIX` listener to a temporary path and reply in this wire
-format — this is exactly how `cp.py` itself is tested. Cover at minimum:
+format. For a Python client, override `cp.SOCKET_PATH` to point at it — the
+constant exists to be overridden for exactly this.
+
+`cp.py`'s own suite works this way and is worth reading as a worked example, both
+of the mock and of which failure modes are worth covering:
+[tests/test_cp.py](../tests/test_cp.py), runnable with
+`python3 -m unittest discover -s tests`. It was written on 2026-08-17 after a
+review found nine defects in the module, six of them visible only when the
+backend misbehaves rather than when it answers correctly — which is why the list
+below is mostly failure cases.
+
+Cover at minimum:
 
 - A well-formed `get` response with a JSON body
 - A well-formed response with a plain-string body (simulating `alert` or a

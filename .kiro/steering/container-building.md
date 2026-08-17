@@ -55,9 +55,12 @@ Follow these conventions established in this repo:
    - Copy `cp.py` from the repo root (canonical copy; each sample keeps an identical copy because the Docker build context cannot reach outside the service directory). It is standard library only — do not add `py3-requests`
    - Use `cp.get()`, `cp.put()`, `cp.log()` etc. for router communication
    - Use `cp.get_appdata()` for user-configurable settings
-   - Use `cp.wait_for_uptime()` and `cp.wait_for_wan_connection()` at startup if needed
+   - Use `cp.wait_for_uptime()` and `cp.wait_for_wan_connection()` at startup if needed, and **pass them the `stop` event** (`cp.wait_for_uptime(60, stop=stop)`). Use a `threading.Event` as the shutdown flag rather than a bare boolean: `Event.wait(interval)` is both the poll sleep and the flag check, and the readiness helpers accept the same event. Without it, a SIGTERM during a startup wait is not acted on until that call's own timeout (300s) expires, which outlasts the container stop grace period and ends in SIGKILL
    - When feeding Config Store data to an off-the-shelf daemon, use a loopback TCP/UDP socket rather than a FIFO or pty posing as a device file, and emit the target protocol's explicit invalid/no-data value when router state goes stale instead of repeating the last known value
    - `cp.py` swallows its own errors: reads return `None` and writes return normally whether or not they succeeded. Use `cp.config_store_available()` to tell "no Config Store" apart from "no data", verify any write that gets reported to a user by reading it back, and read a `config/...` path before writing it. See the Error Handling Contract in `docs/ncos-sdk-reference.md`
+   - **Prefer "attempt the read, then explain a `None`" over "ask whether the backend is up, then decide whether to read".** `cp.config_store_available()` is reliable again (it re-probes a failed backend on a 30s cooldown, and a hung Config Store now counts as a failure rather than a success — both fixed 2026-08-17 and regression-tested), but a gate consulted before every read still adds a way to be wrong without adding information, and inside the cooldown window it answers from cache anyway. Call it when a `None` needs explaining to a human, not to decide whether to try
+   - Treat a documented behaviour of a shared module as a claim to verify, not a fact, whenever a design depends on it. This repo's own docs have twice described `cp.py` behaviour the module did not have. Executing it against a mock socket settles the question in minutes; reading it does not — `tests/test_cp.py` is the harness to extend
+   - `cp.py` can also drive a *remote* router over HTTP (`cp.use_rest()`), which is for development machines: it lets an application's logic be exercised against a real router before it is containerised. **On the router it is refused** — `use_rest()` raises when the Config Store socket exists, since local access is already available and REST would only add credentials and the risk of addressing the wrong device — and it never engages on its own, so a missing `$CONFIG_STORE` volume still fails visibly. Never put router credentials in an image; the socket needs none. `force=True` exists only for a container deliberately reaching a *different* router, which is a decision to weigh, not a convenience
    - Before writing any `config/...` field, confirm its type and meaning in the DTD (`docs/ncos-api/dtd-usage.md`), not from example code. Semantics are per-path — the same field name can mean the opposite thing in another section — and when a DTD comment is ambiguous the shipped defaults are the strongest available evidence
    - **Resolve a config path before reading it, do not guess.** Search `docs/ncos-api/config/PATHS.md` (or walk the DTD) for the distinctive leaf token, e.g. `container`, not a full guessed path like `config/system/container`. Reading a nonexistent path returns `null`, exactly like a path that exists and is empty, so guessing produces a confident wrong conclusion instead of an error. UI menu structure is not a guide to tree structure: the NCM UI shows containers under SYSTEM, while the config path is `config/container`
 
@@ -101,9 +104,12 @@ Most of this runs on the development machine. Do it before claiming the containe
 4. Unit-test pure logic (coordinate conversion, geometry, protocol formatting, state machines) directly, and validate any generated wire format by feeding it to the real consumer rather than only checking it for well-formedness.
 5. Report measured numbers — image size per architecture, and what was and was not verified. Do not estimate sizes that can be measured.
 6. Never run entrypoints or config-generation scripts on the host — they write absolute paths like `/etc/<daemon>/`. Run them inside the built image with `--entrypoint sh` so the writes are contained.
-7. Config Store logic can be tested without a router by binding a mock `AF_UNIX` socket and overriding `cp.SOCKET_PATH`. See "Verifying Before Deployment" in `docs/container-development-guide.md`.
-8. Clean up test artifacts, temporary scripts, local images and `__pycache__` before finishing.
-9. Report what was verified in the chat response, not in the sample's README. A README describes the container to someone deploying it; build-time verification notes (image sizes, what was run locally vs. not verifiable without a router, docker stop timing) are a different audience and go stale the moment the container changes. Keep the README to what it does, its files, configuration, building, and deployment.
+7. Config Store logic can be tested without a router by binding a mock `AF_UNIX` socket and overriding `cp.SOCKET_PATH`. See "Verifying Before Deployment" in `docs/container-development-guide.md`, and `tests/test_cp.py` for a worked example (`python3 -m unittest discover -s tests`). That harness is worth the hundred lines it costs: written to review `cp.py` on 2026-08-17, it found six behavioural bugs in the shared client itself. `cp.py` is covered by it now; a sample's own logic is not.
+8. **Induce the failures your health and status code exists to detect, and watch it report them.** Confirming a probe says "healthy" while things are healthy tests almost nothing — a probe can be wrong only in the red direction. For anything touching `cs.sock`, exercise three distinct states, since only the first happens for free locally: socket absent, socket present but never answering (a hung Config Store, which is what a wedged container engine looks like), and socket answering with a truncated or non-JSON body. Any cached "unavailable" state needs an explicit path back to available, or one transient startup failure becomes a permanent one in a container that still looks alive.
+9. **Check paths case-exactly, against `git ls-files` rather than the filesystem.** The image is Linux and case-sensitive; macOS is not, so a `COPY`, `PYTHONPATH`, `import` or documented path whose case is wrong builds fine locally and fails on a Linux builder. `os.path.exists()` and `ls` will happily confirm a path a fresh clone does not have. This applies to the dangling-reference sweep as well — that checker gives false negatives on macOS unless it consults git. Keep the extractor strict when sweeping docs (markdown links, plus backticked tokens that end in a real file extension or start with a known top-level directory): a looser one flags every path-shaped token that is not a path — API prefixes like `status/`, URL schemes, generic filenames, sample nicknames — and a noisy report gets ignored, which is worse than no report.
+10. **Verify scripted multi-site edits by match count, not by exit status.** A bulk `str.replace()` across a file needs an asserted occurrence count or a bounded target section, then a read of each changed site. A short pattern intended for one place routinely matches three, and the script reports success either way.
+11. Clean up test artifacts, temporary scripts, local images and `__pycache__` before finishing.
+12. Report what was verified in the chat response, not in the sample's README. A README describes the container to someone deploying it; build-time verification notes (image sizes, what was run locally vs. not verifiable without a router, docker stop timing) are a different audience and go stale the moment the container changes. Keep the README to what it does, its files, configuration, building, and deployment.
 
 ## Phase 2c: Verify On the Development Router
 
@@ -138,26 +144,26 @@ Local verification cannot cover Config Store behaviour, image pulls, or anything
 ### SNMP_agent/ — Simple daemon pattern
 
 The `SNMP_agent/` directory is a reference for simple long-running daemons:
-- `Dockerfile` — Alpine base, minimal packages, entrypoint pattern
-- `entrypoint.sh` — Config generation then exec into main process
-- `gen_conf.py` — Reading router config via cp.py to generate app config
-- `ncos_snmp.py` — Long-running daemon using cp.py for data
-- `cp.py` — The SDK module (copy into new containers)
+- `containers/SNMP_agent/Dockerfile` — Alpine base, minimal packages, entrypoint pattern
+- `containers/SNMP_agent/entrypoint.sh` — Config generation then exec into main process
+- `containers/SNMP_agent/gen_conf.py` — Reading router config via cp.py to generate app config
+- `containers/SNMP_agent/ncos_snmp.py` — Long-running daemon using cp.py for data
+- `containers/SNMP_agent/cp.py` — The SDK module (copy into new containers)
 
 ### edge_ai/ — Computer Vision / AI pattern
 
 The `edge_ai/` directory is a reference for complex multi-threaded applications with video processing, AI inference, and web UIs:
-- `cp.py` — the minimal Config Store client (identical to the canonical copy at the repo root)
-- `edge_ai/src/main.py` — Entry point: signal handlers, component initialization, thread orchestration, graceful shutdown
-- `edge_ai/src/config.py` — Configuration via `cp.get_appdata()` / `cp.put_appdata()` with full validation and self-provisioning defaults
-- `edge_ai/src/capture.py` — RTSP capture via PyAV with TCP transport, frame skipping, disconnect detection, and exponential-backoff reconnection
-- `edge_ai/src/inference.py` — TFLite inference engine supporting SSD MobileNet V2 and YOLOv5n, pre-allocated buffers, NMS, thread-safe threshold updates
-- `edge_ai/src/annotation.py` — OpenCV-based bounding box drawing with confidence color-coding, FPS overlay, rolling FPS calculator
-- `edge_ai/src/processor.py` — Pipeline orchestrator: capture→infer→annotate with adaptive rate control, inference frame skipping, double-buffer frame sharing
-- `edge_ai/src/web_server.py` — MJPEG streaming, REST API (stats/config/control), multi-user session control, static file serving
-- `edge_ai/src/models.py` — Dataclasses: Detection, AppConfig, RuntimeStats
-- `edge_ai/src/templates/index.html` — Self-contained web UI (no CDN dependencies)
-- `edge_ai/models/` — TFLite model files (INT8 quantized for ARM64 XNNPACK)
+- `containers/edge_ai/cp.py` — the minimal Config Store client (identical to the canonical copy at the repo root)
+- `containers/edge_ai/src/main.py` — Entry point: signal handlers, component initialization, thread orchestration, graceful shutdown
+- `containers/edge_ai/src/config.py` — Configuration via `cp.get_appdata()` / `cp.put_appdata()` with full validation and self-provisioning defaults
+- `containers/edge_ai/src/capture.py` — RTSP capture via PyAV with TCP transport, frame skipping, disconnect detection, and exponential-backoff reconnection
+- `containers/edge_ai/src/inference.py` — TFLite inference engine supporting SSD MobileNet V2 and YOLOv5n, pre-allocated buffers, NMS, thread-safe threshold updates
+- `containers/edge_ai/src/annotation.py` — OpenCV-based bounding box drawing with confidence color-coding, FPS overlay, rolling FPS calculator
+- `containers/edge_ai/src/processor.py` — Pipeline orchestrator: capture→infer→annotate with adaptive rate control, inference frame skipping, double-buffer frame sharing
+- `containers/edge_ai/src/web_server.py` — MJPEG streaming, REST API (stats/config/control), multi-user session control, static file serving
+- `containers/edge_ai/src/models.py` — Dataclasses: Detection, AppConfig, RuntimeStats
+- `containers/edge_ai/src/templates/index.html` — Self-contained web UI (no CDN dependencies)
+- `containers/edge_ai/models/` — TFLite model files (INT8 quantized for ARM64 XNNPACK)
 
 Key patterns to study in edge_ai:
 1. **Multi-threaded pipeline** with `threading.Event` for shutdown coordination
@@ -172,15 +178,15 @@ Key patterns to study in edge_ai:
 
 The `rtsp_viewer/` directory is a reference for containers that have no
 Config Store integration at all — not every sample needs `cp.py`:
-- `Dockerfile` — picks the go2rtc release binary matching `TARGETARCH`/
+- `containers/rtsp_viewer/Dockerfile` — picks the go2rtc release binary matching `TARGETARCH`/
   `TARGETVARIANT` at build time, so one Dockerfile covers both architectures
   instead of hardcoding a single platform's asset URL
-- `entrypoint.sh` — generates config from environment variables only if no
+- `containers/rtsp_viewer/entrypoint.sh` — generates config from environment variables only if no
   config file is already present, so the same image supports both a
   bind-mounted config (local dev) and an env-var-only deployment (NCOS, which
   cannot bind-mount host files)
-- Two compose files: `docker-compose.yml` for local build-and-run, and
-  `docker-compose.cradlepoint.yml` as the NCOS deployment example — a pattern
+- Two compose files: `containers/rtsp_viewer/docker-compose.yml` for local
+  build-and-run, and `containers/rtsp_viewer/docker-compose.cradlepoint.yml` as the NCOS deployment example — a pattern
   worth reusing whenever a sample's local and router configuration diverge
   enough that one file would need contradictory comments
 

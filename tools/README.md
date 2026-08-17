@@ -4,6 +4,26 @@ Tools that run on your workstation, not on the router and not inside a
 container. Nothing here belongs in an image: containers reach the router through
 `cp.py` and the Config Store socket, with no credentials involved.
 
+### This vs. `cp.use_rest()`
+
+`cp.py` can also talk to a remote router over HTTP, so it is worth being clear
+which to reach for — two overlapping mechanisms are worse than either one:
+
+- **`dev_router.py` (here) is the operator tool.** It owns `.env` parsing and
+  credential hygiene, and it covers the things REST cannot do at all: `container
+  list` / `logs` / `exec` over SSH, and deploying compose projects. Use it to
+  drive a router.
+- **`cp.use_rest()` is for running container code off-router.** It points the
+  same module a container imports at a remote router, so an application's logic
+  can be exercised before it is ever containerised, with no code changes. Use it
+  inside a program you are developing. It refuses to engage where the Config
+  Store socket exists, so the same code on the router always uses the socket.
+
+Both read the same `NCOS_DEV_*` variables, so one `.env` configures both — export
+it (`set -a && . ./.env && set +a`) and `cp.use_rest()` picks it up. See
+"Remote Router (REST transport)" in
+[../docs/ncos-sdk-reference.md](../docs/ncos-sdk-reference.md).
+
 ## Development router access
 
 Credentials live in `.env` at the repo root, which is gitignored. Create it:

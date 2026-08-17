@@ -1276,3 +1276,419 @@ gap worth recording on its own, since it will recur for any future sample.
   success/failure) would settle this the same way the `alert()` and
   `cp.register()` questions were settled elsewhere in this file — worth doing
   before, not during, a build that actually needs the answer.
+
+## 2026-08-17 — Reviewing the shared client instead of building a container
+
+No container was built. The task was a code review of the vendored `cp.py`,
+which found nine defects — six of them confirmed by execution against a mock
+`AF_UNIX` socket rather than by reading. The lessons are about how shared code
+and the docs describing it drift apart, and they apply to any future build that
+depends on either.
+
+### Reading a module is not verifying it, and a doc that describes code is not evidence about that code
+
+- Two documents made claims about `cp.py`'s behaviour that the module does not
+  have. `docs/ncos-sdk-reference.md` stated that its connectivity probe
+  "re-prob[es] periodically" so a socket appearing later is picked up without a
+  restart; the probe actually runs only while the cached state is `None`, so
+  after one failure it returns a cached `False` forever. `docs/cs-sock-protocol.md`
+  stated that a mock-socket harness "is exactly how `cp.py` itself is tested";
+  no test suite for it exists anywhere in the repo. Both read as settled fact,
+  both had survived multiple sessions, and both are the same failure this file
+  has now recorded several times from different directions — except this time the
+  unverified claim was about **our own code**, which feels far more trustworthy
+  than a claim about the platform and is therefore less likely to be challenged.
+- **Anything that reasons about a shared module's behaviour — a design decision,
+  a doc sentence, a review finding — should be settled by running the module, not
+  by reading it or by reading its documentation.** Reading found the suspicious
+  lines; executing was what turned each one from "this looks wrong" into a
+  reproducible fact with observed output, and one suspicion did not survive
+  execution. The cost was about a hundred lines of throwaway harness for nine
+  findings.
+- Corollary for review work specifically: **write the harness before writing the
+  findings.** Presenting a read-only review as fact is the same act as recording
+  an untested platform claim as fact.
+
+### A spec and the implementation it was derived from diverge silently
+
+- `docs/cs-sock-protocol.md` says it was "cross-checked against `cp.py`'s
+  implementation", and its parsing algorithm explicitly instructs clients to
+  "treat a timeout here as 'malformed or hung response', not as success."
+  `cp.py` does the opposite: it returns a synthetic `timeout` status as an
+  ordinary value and then records the exchange as a transport *success*. A spec
+  written *from* an implementation reads as though it certifies that
+  implementation, and nobody re-checks the direction of the claim.
+- **When a document specifies behaviour and also claims to have been checked
+  against a reference implementation, those are two separate claims.** The spec
+  can be right and the implementation wrong. Say which one was actually
+  executed, and when a divergence is found, annotate the *implementation's* doc
+  rather than quietly relaxing the spec to match the code.
+
+### Health and diagnostic code needs a test that the unhealthy state reports unhealthy
+
+- `cp.py`'s whole transport-health layer exists to distinguish "no Config Store"
+  from "no data" — advice this file has given repeatedly and that every sample
+  now follows. Against a socket that accepts the connection and never replies
+  (the signature of a wedged container engine, already documented here), it
+  reported `available: True`, `last_error: None`, `failures: 0`. The one failure
+  mode most worth detecting was the one it declared healthy.
+- **General rule: a health check, status endpoint, or availability probe is only
+  verified once you have induced the failure it exists to detect and watched it
+  report that failure.** Confirming it says "healthy" when things are healthy
+  tests almost nothing. This extends the existing multi-process lesson (a health
+  check must cover the process that is not PID 1) from *coverage* to *polarity* —
+  cover the right thing, and prove it can actually go red.
+- Three failure states are worth inducing deliberately for anything that talks
+  to `cs.sock`: socket absent, socket present but never answering, and socket
+  answering with a truncated or non-JSON body. Only the first happens for free
+  by running locally.
+
+### Cached "unavailable" state is a latch unless something clears it
+
+- The re-probe bug's real damage is structural, not cosmetic: a long-running
+  poller that gates its read on a cached availability flag converts one
+  transient startup failure into a permanent outage, and the container looks
+  alive and logs cheerfully the whole time. The socket being absent at second
+  zero — e.g. because the container started before the Config Store was
+  ready — is exactly the case that then never recovers.
+- **Any cached negative state in a long-running container needs an explicit path
+  back to positive**: a re-probe on a cooldown, an unconditional retry of the
+  real operation, or clearing the cache when the underlying condition
+  (`os.path.exists` on the socket) changes. Prefer attempting the real operation
+  and diagnosing its failure over consulting a cached flag to decide whether to
+  attempt it at all — the flag adds a way to be wrong without adding
+  information.
+
+### Audit which lines sit inside a broad `except Exception`
+
+- Two mirror-image defects around the same try block. Command encoding is
+  *inside* it, so a non-ASCII path is caught, logged as "config store
+  unreachable", and counted as a transport failure — a caller-side argument
+  error misattributed to the router, which then latches the availability flag
+  described above. JSON encoding of the value is *outside* it, so a
+  non-serialisable value raises straight past the module's documented
+  "accessors do not raise" contract.
+- **In any wrapper whose contract is "never raise, survive anything", the try
+  block's boundaries are part of the contract.** Walk them line by line: work
+  that can fail for *caller* reasons should be validated and reported as a
+  caller error before the remote call, and everything that can fail for *remote*
+  reasons must be inside. A broad handler is not a substitute for knowing which
+  is which, because it silently relabels one as the other.
+
+### Fix a hazard in every sibling code path, not just the one that prompted it
+
+- `alert()` sanitises newlines out of its fields, with an accurate comment
+  explaining that the protocol is newline-delimited and that interpolated data
+  makes injection a real hazard rather than a theoretical one. The reasoning is
+  entirely generic, yet `get`/`put`/`post`/`delete` interpolate paths and
+  queries into the same newline-delimited protocol with no sanitisation at all —
+  a path containing a newline sends more protocol fields than the verb takes.
+- **When a fix lands with a comment explaining a general hazard, that comment is
+  a to-do list for the module's other call paths.** Grep for the sibling paths in
+  the same change. Harmless today only because every caller happens to hardcode
+  its paths — which is a property of the callers, not a property of the module,
+  and the repo already documents an adapter pattern that would forward
+  request-supplied paths.
+
+### Symmetric operations need symmetric matching rules
+
+- `get_appdata()` matches names case-insensitively; `put_appdata()` and
+  `delete_appdata()` match case-sensitively. So `put_appdata('Poll_Interval', x)`
+  against an existing `poll_interval` creates a **duplicate** config entry, then
+  its own read-back finds the older entry and returns `False` — a write that
+  half-happened and reported failure. Observed on the wire.
+- **Any get/set/delete trio over the same keyspace must share one key-matching
+  rule, ideally one helper.** Where a read is deliberately lenient (case
+  folding, whitespace trimming, aliases), the write and delete must fold
+  identically or they address a different record than the read does. This is
+  worth checking whenever a read-back is used as write verification, since the
+  mismatch makes the verification itself lie.
+
+### Do not manufacture a value that looks valid out of missing parts
+
+- An identity accessor built a version string by interpolating three fields it
+  never checked, returning the string `'None.None.None'` when the payload lacked
+  the expected keys, while every sibling accessor returns `None` on an
+  unexpected shape. A string like that flows into logs, comparisons and status
+  APIs looking like data.
+- **When assembling a value from several fetched parts, validate the parts, and
+  return the module's own "no data" value if any are missing.** Since every
+  `cp.get()` can return `None` for a path this firmware or model does not have
+  (already a standing rule in this file), composite accessors are where that
+  `None` most easily gets laundered into a plausible-looking result.
+
+### A timeout parameter should bound the wall clock, not the intent
+
+- `wait_for_uptime(min_uptime_seconds=60, timeout=3.0)` returned after 10.0
+  seconds and then logged "timed out after 3.0s". The internal sleep is chosen
+  from how long the wait is expected to need and is never clamped to the
+  remaining deadline.
+- **Clamp every sleep inside a bounded wait to the time left before the
+  deadline.** This matters beyond tidiness for containers: `docker stop` timing
+  is already the standing shutdown trap in this repo, and a readiness helper
+  that overshoots its own stated timeout by 3x during startup is
+  indistinguishable from an entrypoint that ignores signals.
+
+### Reviewing shared code means locating every copy first
+
+- Vendored copies mean a review's blast radius is not the file in the editor.
+  Checksumming all copies before starting cost one command, confirmed all five
+  were byte-identical, and made every finding attributable to the canonical copy
+  rather than to the sample that happened to be open. Worth doing at the *start*
+  of a review, not at the end when a fix is being written, because it determines
+  whether findings are local or repo-wide.
+
+### An analysis request is not an implementation request
+
+- The ask was "analyze for bugs and improvements", and nine confirmed defects
+  across five vendored copies plus their reference docs is a large,
+  cross-cutting change. Reporting the findings with a proposed fix order and
+  waiting was the right stopping point. **Volume of findings is not consent to
+  act on them** — and for shared code that every sample vendors, the decision
+  about scope and sequencing genuinely belongs to the user.
+
+## 2026-08-17 (second entry) — Fixing the shared client, and two self-inflicted errors
+
+Implemented the nine `cp.py` defects from the morning's review, added an opt-in
+HTTP/REST transport, and wrote the module's first test suite. The two most
+valuable lessons are the mistakes I made and caught in final verification, so
+they lead.
+
+### A case-insensitive filesystem makes path checks lie, and macOS is one
+
+- I renamed a sample directory reference across three documents because `ls`,
+  `find` and `os.path.exists` all agreed the on-disk name was lowercase. The
+  rename was wrong: **git's index and HEAD both recorded the capitalised name.**
+  Someone had done a case-only rename on disk, and git never noticed because
+  `core.ignorecase=true` on macOS. So every check I ran passed locally and would
+  have failed the moment anyone cloned the repo on Linux.
+- The dangling-path checker this file already recommends is exactly the tool that
+  gave the false negative. **`os.path.exists()` is not a case-exact test on
+  macOS or Windows.** Check paths against `git ls-files` instead, which is
+  case-exact and is also the authority for what a fresh clone actually contains.
+  One command, and it makes the checker trustworthy rather than reassuring.
+- **This is a container-build hazard, not just a docs hygiene one.** The image is
+  Linux and case-sensitive; the development machine usually is not. A
+  `COPY containers/My_Sample/app.py`, a `PYTHONPATH` entry, an `import`, or a
+  config path that differs from the real name only by case will build and run
+  fine on a Mac and fail on a Linux builder or CI — and the error (`file not
+  found` for a file you can see) is genuinely baffling if you don't know to
+  suspect case. Now recorded in `docs/container-development-guide.md`.
+- Generalises to the whole class: **when the development machine is more
+  permissive than the target, a passing local check is weaker evidence than it
+  appears.** This is the same shape as the already-recorded lesson that
+  Docker Desktop is not `cpdockerengine`, arriving through the filesystem
+  instead of the container engine. Name which direction the permissiveness runs
+  before trusting a green result.
+- Worth noting the working tree and the index can disagree indefinitely without
+  anyone noticing, and that a case-only rename needs `git mv` through a
+  temporary name to be recorded at all. Report the discrepancy rather than
+  silently picking a side: renaming a sample directory touches image tags,
+  README references and everyone's checkout, so it is the user's call.
+
+### Scripted multi-site edits need a match-count assertion, not just a successful run
+
+- I replaced a set of short patterns (`` - `Dockerfile` — ``, `` - `entrypoint.sh` — ``)
+  across a steering file to qualify some bare paths. Each pattern occurred in
+  **three** different sample sections, not one, so the script silently relabelled
+  another two samples' file lists with the first sample's directory. The script
+  reported success; the file was wrong.
+- **A bulk `str.replace()` with no count check is an unverified edit.** Either
+  assert the expected number of occurrences before replacing, bound the
+  replacement to a specific section of the file, or make each pattern unique
+  enough to only match its intended site. Then read the result at each site — the
+  script exiting cleanly says nothing about whether it changed the right lines.
+- This is the standing "verify the check before suspecting the code" rule pointed
+  at my own tooling: a scripted edit is a tool, and it needs the same
+  verification as any test. Both of this session's errors were caught only
+  because I re-ran a full verification pass at the end rather than trusting the
+  intermediate steps.
+
+### Adding a second backend proves whether an abstraction was earning its keep
+
+- Asked whether unwrapping responses (`get()` returning the payload rather than
+  `{'status', 'data'}`) was a mistake, the strongest answer came from the feature
+  being added in the same change: the REST API wraps replies as
+  `{"success": …, "data": …}` while the socket does not, so the normalisation
+  layer is precisely what lets every accessor, and every caller, work over both
+  transports unchanged. Without it each call site would have to know which
+  transport it was on.
+- **When a design question about an abstraction is hard to answer in the
+  abstract, ask what a second implementation behind it would need.** An
+  abstraction with one implementation always looks like ceremony; the second one
+  is where it either pays for itself or is revealed as noise.
+
+### "Is this design bad?" usually wants a documented rationale, not a refactor
+
+- Two of the three requests this session were questions about existing design
+  decisions (returning `None` instead of raising; unwrapping responses). Both
+  resolved to "keep it", and the deliverable was the *reasoning*, written into
+  the reference doc where the next person to wonder will look — not a change.
+- Worth separating the two things such a question can mean: the design may be
+  wrong, or the design may be right and its consequences under-documented. Here
+  the ambiguity that prompted the question was real (`None` genuinely does not
+  distinguish "no data" from "no router") but the fix was better diagnostics, not
+  a different error-handling contract. **Find the real defect near the question
+  before agreeing to the framing in the question.**
+- Reinforces the existing "fix bugs, preserve contracts" lesson from a different
+  angle: the pressure to change a shared contract can come from a reasonable
+  question rather than from a bug, and it should be resisted the same way.
+
+### A dual-mode client where one mode carries credentials must never fall back
+
+- The new transport points the same module a container imports at a *remote*
+  router with admin credentials. It is **explicit-only, with no automatic
+  fallback**: a missing `$CONFIG_STORE` volume must fail visibly rather than
+  switching. There is a test asserting the remote host is never contacted in
+  that situation.
+- ~~The property that makes that safe to ship inside every image is that it is
+  explicit-only ... not quietly redirect writes to whichever router a leftover
+  environment variable names.~~ **Corrected same day, by the user:** two things
+  wrong with that framing. The scenario was implausible — the credentials file is
+  a gitignored development-host artifact that never enters an image, so those
+  variables are not present in a container unless someone deliberately adds them
+  to compose or the Dockerfile — and "no fallback" was not actually sufficient
+  for the invariant that matters, which is *on the router, never REST*. Nothing
+  stopped an explicit opt-in call from succeeding inside a container. Fixed by
+  refusing outright when the local socket exists, with an explicit `force=True`
+  for the one legitimate cross-device case.
+- Two lessons from that, both general:
+  - **Justify a guard with the real threat model, not the most alarming story
+    available.** An overstated rationale is not harmless: it makes the guard look
+    sufficient, so nobody asks what it fails to cover. Here the dramatic version
+    ("a stray variable could redirect a container") crowded out the plain
+    question "what stops this being used on the router at all?" — which had a
+    much better answer available for a few lines of code. State the preconditions
+    an exposure actually requires; if the honest list is long, say so, and let the
+    guard be judged on what it adds rather than on the scare.
+  - **Where an invariant can be enforced in code, do not settle for documenting
+    it as a convention.** "This transport is for development hosts" was in four
+    documents and a docstring; it was still only advice. A single check against a
+    condition already available locally (does the local socket exist?) converted
+    it into something that cannot be got wrong by accident. Reach for the cheap
+    local signal before writing another paragraph telling the reader not to do
+    the thing.
+- Generalises to any client with a local and a remote mode: **a fallback path is
+  a feature only when both targets are equivalent.** When one is "the machine I
+  am running on" and the other is "some other machine I have credentials for",
+  a fallback turns a local misconfiguration into an action against a remote
+  system. Related standing rule already in this file: a default target is a bug.
+  A fallback target is the same bug with a longer fuse.
+- Two smaller points that generalise: import the optional transport's
+  dependencies lazily inside the functions that need them, so the common path
+  does not pay the memory on a router with a 135 MB floor; and give any object
+  holding a credential a redacted `__repr__` plus a `describe()` that reports
+  `set`/`NOT SET`, so status output stays useful without being dangerous.
+- When adding a second mechanism that overlaps an existing one, state the
+  division of labour where both are documented. Two overlapping mechanisms with
+  no stated boundary is worse than either alone — the same conclusion this file
+  already reached about competing config mechanisms.
+
+### Tests are the right place to pin down a limitation, not just a behaviour
+
+- Some findings from a review are not fixable in the module: a payload that
+  cannot represent a signed zero, for instance, loses information before any code
+  sees it. Writing that as a **passing test that asserts the limited behaviour
+  and explains why in its docstring** is much stronger than a comment: it states
+  the current answer, and it makes a future "fix" that silently changes the
+  behaviour fail loudly enough to force reading the reasoning.
+- Related, for any review-driven work: tie each regression test to the defect it
+  encodes in its docstring (a `regression:` prefix works). Six months on, the
+  test name says what it checks but only the note says why anyone thought to
+  check it, which is what stops the assertion being "simplified" away.
+- **Weight coverage towards failure paths for anything that talks to a backend.**
+  Six of the nine defects were only observable when the backend misbehaved —
+  hung, truncated its reply, or was absent — rather than when it answered
+  correctly. Tests that only exercise good responses would have found three.
+
+### Testing a module that holds process-wide state
+
+- A client module with module-level state (a transport mode, a cached health
+  dict, memoised warnings) is a singleton, so tests must save and restore that
+  state around every case or they leak into each other in order-dependent ways.
+  A base `TestCase` that snapshots the module's tunables and resets its state
+  dict in `setUp` is enough, and it is worth writing before the first test rather
+  than after the first confusing failure.
+- Restore captured output *last* in that teardown, and prefer a silent reset over
+  calling the module's own public "reset" function, which usually logs — a
+  cleanup that emits log lines makes a passing suite look broken.
+- Make anything time-based (a poll cooldown, a receive timeout) a module-level
+  constant specifically so a test can shorten it. Same reasoning as already
+  recorded for the socket path.
+
+### Prefer the stdlib primitive over the hand-rolled loop this repo had been recommending
+
+- This repo's documented interruptible-sleep pattern was a hand-written
+  `_sleep_interruptibly()` that slept in one-second steps checking a boolean
+  flag. It works, but `threading.Event.wait(timeout)` is stdlib, returns the
+  instant the event is set rather than at the next step boundary, needs no helper,
+  and doubles as the flag check — so the recommended pattern was strictly worse
+  than what the standard library already provides. Corrected in
+  `docs/ncos-sdk-reference.md`, and the readiness helpers now accept the same
+  event so a startup wait is covered by one mechanism.
+- **When a doc recommends a hand-rolled pattern, check whether the standard
+  library already solves it before propagating the pattern further.** The
+  hand-rolled version was written to illustrate a real constraint (PEP 475), and
+  illustrating a constraint correctly is not the same as demonstrating the best
+  response to it.
+
+### An `if __name__ == '__main__'` block cannot be tested, so extract it
+
+- Adding the refusal above needed a test that `python3 cp.py --rest` exits
+  cleanly with an explanation rather than raising a traceback. The CLI body was
+  an `if __name__ == '__main__':` block, which is unreachable from a test: it
+  only runs when the file is executed as a script, and by then the module's
+  state cannot be arranged. **Move the body into a `_main(argv=None) -> int`
+  that returns an exit code, and leave only `sys.exit(_main())` in the guard.**
+  Exit codes and error paths then get the same coverage as everything else, for
+  no change in behaviour.
+- Generalises to any script-shaped entry point in a container: the exit code *is*
+  the interface (a restart policy and a health check both read it), so it
+  deserves a test, and it cannot have one while it lives in a module-level
+  block.
+- **`runpy.run_path()` is not a way around this.** My first attempt patched
+  `cp.SOCKET_PATH` on the imported module and then ran the file with `runpy`,
+  which loads a *second, independent* module instance whose state is the
+  default — so the patch had no effect and the check reported a failure that did
+  not exist. I nearly went looking for a bug in the guard. Worth adding to the
+  standing "verify the check before suspecting the code" rule as a specific trap:
+  **when a module carries process-wide state, any test that re-imports or re-runs
+  it is talking to a different object than the one it configured.** Symptoms look
+  exactly like the feature not working.
+
+### Check the boolean logic when enumerating what an exposure requires
+
+- Having just corrected an *overstated* risk, I wrote its replacement as a
+  precondition list joined by "and": credentials present, *and* an explicit call,
+  *and* `force=True`, *and* no local socket. The last two are **alternatives**,
+  not both required — the override only matters when the socket exists. Presenting
+  an `OR` as an `AND` inflates the number of things that must go wrong, which
+  overstates safety exactly as much as the dramatic version overstated risk, and
+  it is harder to spot because the sentence reads as rigour.
+- **When documenting what an exposure requires, write the conditions as a
+  numbered list and check each connective.** Prose hides the difference between
+  "all of these" and "any of these"; a list makes it obvious, and it forces the
+  question of whether each item is independent.
+- Same lesson, said generally: **a precise-sounding claim is not a checked
+  claim.** This file already has that for platform behaviour and for citations.
+  It applies to the logic of one's own sentences too, and a security note is the
+  worst place for it, because a reader counting four barriers will not verify
+  that all four are real.
+
+### A guard is only as good as the case it admits it does not cover
+
+- The signal used to enforce "on the router, always the socket" is a local
+  condition the module already checked for *reporting*: does the Config Store
+  socket exist. **A condition already collected for diagnostics is often
+  available as a policy input**, which is worth remembering before concluding an
+  invariant cannot be enforced and writing another paragraph of advice instead.
+- But it is a heuristic, and it does not cover a container on a router with the
+  `$CONFIG_STORE` volume *missing* — there is no socket to detect then. The
+  honest response was to say so in the reference doc and name what covers that
+  case instead, rather than presenting the guard as total. Resisting the urge to
+  invent a router-detection heuristic matters here: nothing in the container
+  namespace is a confirmed marker, and inferring platform identity from an
+  artifact is a mistake already recorded in this file.
+- **State which case a partial guard closes and which it does not.** A guard
+  documented without limits is read as complete, and the next person to extend
+  the feature will assume the boundary is already defended.

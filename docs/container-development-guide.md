@@ -196,6 +196,34 @@ Decide this from what the container actually needs, per the Phase 1
 clarifying question ("Whether it needs Config Store access"), not from what
 the other examples happen to do.
 
+### Paths Are Case-Sensitive in the Image, Probably Not on Your Machine
+
+The image is Linux, where `App.py` and `app.py` are different files. macOS
+(APFS/HFS+ by default) and Windows are case-insensitive, so a `COPY`, a
+`PYTHONPATH` entry, an `import`, or a config path whose case does not match the
+real filename **builds and runs correctly on your machine and fails on a Linux
+builder or CI** — reporting a file not found for a file you can plainly see.
+
+Two habits avoid it:
+
+- Keep every path lowercase with underscores, matching the directory name, the
+  `CP_APP_NAME`, and the compose service name (this is the same one-name rule
+  that keeps a pushed image tag matching the deployed `image:`).
+- **Verify paths against `git ls-files`, not the filesystem.** `os.path.exists()`
+  and `ls` are not case-exact on a case-insensitive volume, so they will confirm
+  a path that a fresh clone on Linux does not have. Git is case-exact and is the
+  authority on what anyone else will actually check out.
+
+```bash
+# Does the repo really contain this path, exactly as written?
+git ls-files | grep -x 'containers/my_sample/app.py'
+```
+
+Watch for the inverse too: with `core.ignorecase=true` (the default on macOS),
+git does **not** notice a case-only rename done on disk, so the working tree and
+the index can disagree indefinitely with nothing looking wrong locally. A
+case-only rename has to go through `git mv` via a temporary name to be recorded.
+
 ### Python Applications
 
 For Python-based containers:
@@ -255,21 +283,39 @@ The platform resolves `$CONFIG_STORE` and handles the mount path automatically �
 Copy `cp.py` from the repository root into your container and set `PYTHONPATH`. It is standard library only, so no extra Alpine packages are required:
 
 ```python
+import signal
+import threading
+
 import cp
 
-# Read router status
-product_info = cp.get('status/product_info')
+stop = threading.Event()
+signal.signal(signal.SIGTERM, lambda *_: stop.set())
+
+# Read router status. Every accessor can return None -- the router may not have
+# this path, and a missing $CONFIG_STORE volume looks identical.
+product_info = cp.get('status/product_info') or {}
 cp.log(f"Running on {product_info.get('product_name')}")
 
 # Read user-configured appdata
 my_config = cp.get_appdata('my_setting') or 'default'
 
-# Wait for router readiness at startup
-cp.wait_for_uptime(60)
-cp.wait_for_wan_connection(timeout=120)
+# Wait for router readiness at startup. Pass the stop event, or a SIGTERM
+# arriving during the wait is not acted on until the timeout expires.
+cp.wait_for_uptime(60, stop=stop)
+cp.wait_for_wan_connection(timeout=120, stop=stop)
 ```
 
 See [ncos-sdk-reference.md](ncos-sdk-reference.md) for the full API.
+
+The same module drives a *remote* router over HTTP from a development machine
+(`cp.use_rest()`), which is useful for testing an application's logic before it
+is ever containerised. **On the router it is refused**: if the Config Store
+socket exists, `cp.use_rest()` raises rather than switching, because local access
+is already available and REST would only add credentials and the chance of
+aiming at the wrong device. It also never engages on its own, so a container with
+a missing `$CONFIG_STORE` volume fails visibly instead of quietly going
+elsewhere. Do not put router credentials in an image; on the router, the socket
+needs none.
 
 ### Giving More Than One Consumer Access to the Config Store
 
@@ -484,13 +530,14 @@ modes. A `signal.signal()` handler running does not make a blocked
 duration per PEP 475), so `while True: ...; time.sleep(interval)` with a
 flag-setting handler only exits on the *next* loop iteration after the current
 sleep completes, and a startup call to `cp.wait_for_uptime()` or another
-`wait_for_*` helper delays shutdown by up to its own `timeout` (300s default),
-since none of them take a stop flag. Test this specifically whenever a
-container polls in a loop or calls a `wait_for_*` function at startup: stop it
-while it is inside the sleep or the wait, not just at idle, and confirm the
-return time still matches what step 4 measured. See "Signal Handling in Polling
-Loops" in [ncos-sdk-reference.md](ncos-sdk-reference.md) for the interruptible
-sleep pattern.
+`wait_for_*` helper delays shutdown by up to its own `timeout` (300s default)
+unless it is given the `stop` event. Test this specifically whenever a container
+polls in a loop or calls a `wait_for_*` function at startup: stop it while it is
+inside the sleep or the wait, not just at idle, and confirm the return time still
+matches what step 4 measured. Use a `threading.Event` for the stop flag and pass
+it to the readiness helpers; `Event.wait()` is both the sleep and the check. See
+"Signal Handling in Polling Loops" in
+[ncos-sdk-reference.md](ncos-sdk-reference.md).
 
 **The engine itself differs, and this matters for what "verified locally" can
 claim.** The commands above run against Docker Desktop (or plain Docker
@@ -536,6 +583,33 @@ parser:
   succeed. `content-length` is accurate and counts the body only.
 That covers unwrapping, appdata round-trips, malformed and truncated replies,
 receive timeouts, and the missing-socket path, none of which need a router.
+
+Use it on your own status and health code too, not just on the happy path. A
+probe that reports "available" while things are available has demonstrated
+almost nothing — the only interesting direction is whether it can go red, so
+induce each failure and watch it be reported. Three states are worth inducing
+for anything reading `cs.sock`, and only the first happens for free by running
+locally:
+
+- **Socket absent** — the `$CONFIG_STORE` volume was not attached.
+- **Socket present but never answering** — accept the connection and send
+  nothing. This is what a wedged container engine looks like, and it is the state
+  most likely to be misreported as healthy.
+- **Socket answering badly** — a truncated body, or a plain-string body where
+  JSON was expected.
+
+`cp.py` covers these three paths itself now — see
+[tests/test_cp.py](../tests/test_cp.py), which is worth reading as a worked
+example of the mock. That suite exists because a review on 2026-08-17 found real
+defects in exactly these paths, including a hung Config Store being counted as a
+successful exchange. Your own status code is not covered by it, so induce the
+same three states against whatever you build on top.
+
+Any cached "unavailable" state also needs an explicit route back to available —
+otherwise a socket that is simply not ready at second zero turns one transient
+startup failure into a permanent outage in a container that keeps running and
+logging normally. `cp.config_store_available()` re-probes on a 30-second
+cooldown for this reason.
 
 **Never run a container's entrypoint or config-generation scripts directly on
 your development machine.** They write to absolute system paths such as
