@@ -6,10 +6,6 @@ as the media server. go2rtc handles the RTSP-to-WebRTC/MJPEG bridging, low-laten
 browser playback, and a small web UI; this container just wires its config to
 the deployment environment NCOS provides.
 
-NCOS has no native RTSP viewing or transcoding capability, so this is a
-straightforward gap-filler rather than a workaround for a defect in something
-native.
-
 ## What It Does
 
 ```
