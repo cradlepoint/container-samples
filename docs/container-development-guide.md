@@ -79,6 +79,20 @@ FROM alpine:3.18
 RUN apk add --no-cache python3
 ```
 
+**Package presence is not feature presence.** A package existing in Alpine does
+not mean Alpine's build of it includes the optional module a design depends on,
+and the image will build and start perfectly either way. Where a design needs a
+specific plugin, backend or optional feature of an off-the-shelf daemon, check for
+that feature — not the package name — before committing to the base image:
+`apk add` it in a throwaway container and list the module directory. This costs
+minutes during design and is the base-image decision, so it is expensive to
+discover after a sample is written.
+
+When the feature genuinely only exists on another base, or only via compiling from
+source with it enabled, that is a real decision with a size cost. Measure both
+architectures and report the numbers rather than switching bases silently or
+quietly dropping the feature.
+
 ### Keep Images Minimal
 
 - Use `--no-cache` with `apk add` to avoid caching package indexes
@@ -430,6 +444,42 @@ ports:
   - '8080:8080'        # TCP port (default)
 ```
 
+### Routing LAN Traffic Through a Container
+
+A container that forwards, proxies or tunnels on behalf of LAN hosts needs those
+hosts' traffic to arrive at it. Port mapping does not help — that publishes a
+service, it does not put the container in the path. The container first needs an
+address on a real LAN segment (a custom network bound to a Local IP Network, not
+the `172.17.x` bridge), and then one of three mechanisms:
+
+| Mechanism | Config | Use when |
+|-----------|--------|----------|
+| Static route | `config/routing/tables[name=Main]/routes` with `gw` = the container's address | Specific destinations only. Simplest, no client-side change |
+| Source-based policy routing | `config/routing/tables` for the table, `config/routing/policies` with `src_ip_network` or `in_dev` and the table's UUID | *All* destinations, without redirecting the router's own traffic |
+| DHCP options | `config/lan/dhcpd/options` (`option: 3` for the default gateway, `121` for classless static routes) plus `options_enabled` | No router routing config; DHCP clients only |
+
+**A catch-all static route in the Main table pointing at a container is a trap.**
+It captures the router's own traffic too — management, DNS, and any traffic the
+container itself originates toward an upstream, which then loops back into the
+container. This is what source-based policy routing exists for: it scopes the
+redirect to LAN-sourced traffic and leaves the router's own default alone.
+`config/routing/policies` fields are `src_ip_network`, `dst_ip_network`, `in_dev`,
+`priority` and `table`.
+
+Two things to verify on hardware, since the DTD proves only that the fields and
+their types exist: that NCOS installs a route or policy whose next-hop is a
+container address (`gw` is typed `ipany`, so the schema does not constrain it),
+and which direction `priority` sorts for policies — the shipped default uses
+`priority: 0` pointing at the Main table, and priority semantics are not
+consistent across the NCOS config tree, so confirm by behaviour rather than
+inference (see [ncos-api/dtd-usage.md](ncos-api/dtd-usage.md)).
+
+Expect a hairpin with policy routing or a static route: the client sends to the
+router, which forwards back out the same LAN interface to the container. That
+works, and the router may emit ICMP redirects pointing clients at the container
+directly. DHCP option 3 avoids the extra hop by having clients address the
+container in the first place, at the cost of covering only DHCP clients.
+
 ### Reaching the Router from a Container
 
 The router IP is the default gateway of the container's bridge network. To discover it programmatically:
@@ -496,7 +546,37 @@ services:
       retries: 3
 ```
 
-Exit code 0 = healthy, non-zero = unhealthy. After `retries` failures, the container is restarted.
+Exit code 0 = healthy, non-zero = unhealthy.
+
+**Whether an unhealthy container is actually restarted is UNVERIFIED.** This page
+previously stated flatly that it is restarted after `retries` failures, with no
+evidence cited. Plain Docker Engine does *not* restart on health check failure —
+it only marks the container unhealthy; restart-on-unhealthy is Swarm behaviour.
+Whether `cpdockerengine` acts on the result is unconfirmed, so a health check is
+reliable as a *status signal* and not as a recovery mechanism.
+
+**Put recovery inside the container**, where it does not depend on engine
+behaviour. For a container that maintains a session with something — a tunnel, a
+broker connection, a replication stream — that means a watchdog that checks
+observed state on an interval and re-establishes, plus exiting non-zero when the
+main process dies so the restart policy (which *is* documented) can act. Keep the
+health check as well, for visibility, but do not let it be the only thing standing
+between a dead session and an outage.
+
+### Enumerate a Daemon's Recovery Triggers, Do Not Assume It Reconnects
+
+An off-the-shelf daemon that advertises reconnection usually implements several
+distinct mechanisms, each firing on a specific trigger — one at configuration
+load, one when the *peer* closes the session, one when a liveness check concludes
+the peer is dead. A session that disappears by any other route falls through all
+of them and stays down permanently, and the container looks perfectly healthy
+throughout because its main process is alive.
+
+Read the daemon's documentation for which trigger each recovery option responds
+to, then **test by inducing a teardown outside that set** — terminate the session
+administratively rather than by blocking traffic or killing the peer. If nothing
+recovers, add a watchdog keyed on observed session state rather than on the
+daemon's own notion of failure.
 
 ## Verifying Before Deployment
 
@@ -539,25 +619,43 @@ it to the readiness helpers; `Event.wait()` is both the sleep and the check. See
 "Signal Handling in Polling Loops" in
 [ncos-sdk-reference.md](ncos-sdk-reference.md).
 
-**The engine itself differs, and this matters for what "verified locally" can
-claim.** The commands above run against Docker Desktop (or plain Docker
-Engine) on the development machine. The router runs `cpdockerengine` — a
+**The engine and the kernel both differ, and this decides what "verified
+locally" can claim.** The commands above run against Docker Desktop (or plain
+Docker Engine) on the development machine. The router runs `cpdockerengine` — a
 different, more restricted runtime with no Docker API or socket exposed, only
 the `container` CLI and `status/container` (see
 [ncos-api/status/container.md](ncos-api/status/container.md)). It was
 historically balena-derived; whether that ancestry still holds on current
-firmware is unconfirmed and shouldn't be assumed. Most of what step 1-4 checks
-— does the image build and start, do packages exist for the target
-architecture, does the application's own logic behave correctly — transfers
-directly, because it's about the image contents, not the engine running it.
-Kernel-level behaviour such as how PID 1 receives signals inside a container
-also transfers, since that's a property of Linux namespaces rather than of
-Docker Engine specifically. But engine-specific behaviour — exact restart
-policy timing, health check polling internals, resource limit enforcement —
-is not verified by a local run just because the container itself behaved
-correctly, and this repo has no confirmed source for how `cpdockerengine`
-implements any of those. State plainly which category a claim falls into
-rather than presenting local-Docker-Desktop behaviour as router-verified.
+firmware is unconfirmed and shouldn't be assumed.
+
+Sort every local result into one of these three buckets before quoting it:
+
+**Transfers.** Anything that is a property of the image or of the application:
+does it build, do packages exist for the target architecture, does the code
+behave correctly, does a generated config parse, does PID 1 forward signals.
+These are about image contents and universal namespace semantics, not about the
+host.
+
+**Does not transfer — kernel configuration.** Which kernel subsystems, modules,
+device types and virtual interface types exist is a property of *that kernel
+build*. Docker Desktop runs a linuxkit VM kernel; the router runs Cradlepoint's.
+A feature missing locally says nothing about the router, and a feature present
+locally says nothing either — **both directions cause real mistakes**, a false
+negative dropping a viable design and a false positive shipping one that fails
+at deploy. This covers anything reached through `ip link add ... type <x>`,
+kernel IPsec/XFRM, netfilter modules, tunnel drivers, and anything whose
+availability depends on a `CONFIG_*` option. Never conclude "the platform cannot
+do X" from a local kernel result; probe on the router with `container exec`.
+
+**Does not transfer — engine and namespace policy.** Exact restart policy
+timing, health check internals, resource limit enforcement, which capabilities
+`cap_add` actually grants, whether `devices:` and `sysctls:` are honoured, and
+how user namespace remapping affects a privileged operation. Docker Desktop does
+not apply userns remapping by default, so a privileged operation succeeding
+locally is weak evidence at best.
+
+State plainly which bucket a claim falls into rather than presenting
+local-Docker-Desktop behaviour as router-verified.
 
 What running locally will not tell you: anything Config Store related. Without
 `cs.sock` every `cp.py` call returns `None`, so the application runs in its
@@ -622,6 +720,133 @@ validate the output by feeding it to that consumer rather than only unit-testing
 the formatter. A checksum test proves a sentence is well-formed; only the real
 consumer proves it is correct.
 
+Before building the peer emulator, get the **real peer's configuration**. An
+emulator configured from your assumptions verifies that the container works
+against those assumptions, which is worth much less than it appears and can pass
+while the real integration cannot connect at all. Every negotiated parameter that
+was guessed is a failure at connect time. Where a **working client for the same
+peer** already exists — a phone profile, a vendor client's exported settings — ask
+for it too: it is a specification that has already been proven against the live
+peer, and it resolves the parameters the peer's own config leaves ambiguous.
+
+Where the integration involves PKI, generate a real certificate chain for the test
+rather than exercising only the shared-secret path. A throwaway container with the
+relevant tooling can issue a CA and a server certificate with the right identity in
+a few commands, which is the difference between shipping the certificate code path
+exercised and shipping it unexecuted.
+
+When the consumer is third-party equipment nobody has on the desk, run an
+open-source implementation of the **peer** role in a second local container. That
+verifies the whole local stack end to end — module loading, privileges,
+negotiation, and the data path — for the cost of one more service. Be precise
+about which half of the question it settles: it shows *this container can do
+this*, not *the vendor's box will accept it*, because both ends are then the same
+implementation. The residual interop risk belongs in the write-up as specific
+settings to confirm on the peer.
+
+For anything that forwards or routes on behalf of other hosts, use a
+**three-container topology**: a client, the container under test, and the peer. A
+two-container test only exercises traffic the container originates itself, which
+takes a different kernel path (output rather than forward) and misses routing,
+NAT and MTU behaviour entirely.
+
+Assert on the data plane, not just the control plane. A session reported as
+established proves negotiation and authentication; it says nothing about whether
+payload transits. Send real traffic, read the byte and packet counters on both
+ends to confirm the path taken is the intended one, and verify the identity the
+peer *observes* — in any design involving address translation, reading the
+observed source on the peer is what proves the translation happened rather than
+being bypassed by a route you did not notice. Exercise TCP and not only ICMP:
+ICMP passing shows routing and encapsulation work, but only a stateful protocol
+exercises connection tracking and only a real payload exercises MTU, and both of
+those bugs are invisible to `ping`.
+
+Where the container carries other hosts' traffic through a tunnel interface, test
+MTU deliberately — sizes above and below the tunnel MTU, with and without the
+don't-fragment bit, and check whether the sender learns the path MTU. The failure
+mode is small packets working while large ones vanish, which reads as an
+application bug rather than a network one. Clamp MSS regardless: path MTU
+discovery depends on ICMP that real networks filter often enough to make relying
+on it optimistic.
+
+Assert success at the endpoint that consumes the service, not at the container in
+the middle. A middlebox's own counters can show traffic flowing in both directions
+while the client at the edge sees nothing — both readings accurate, because the
+packets really did transit and then went somewhere other than the client. Use
+intermediate counters to localise a fault after the endpoint reports one, not as
+evidence the path works. And when counters are the evidence, reset them between
+phases or record before/after and reason about the delta: an absolute count says
+nothing about which phase produced it.
+
+### Test the Dependency-Down State, and Prefer Fail-Closed
+
+Any container that forwards, proxies or relays other hosts' traffic through a
+conditional path needs verifying with that path **down**, not only up. The usual
+behaviour is a silent fallback: the specific route disappears, traffic falls back
+to the container's ordinary default route, and it egresses somewhere it was never
+meant to — in the clear, and with nothing looking broken.
+
+What makes this worse than an outage is how it interacts with a later change. If
+the NAT rule is scoped to the intended egress interface, leaked packets get no
+replies, so the leak is at least inert. Add a broader NAT rule while
+troubleshooting — a natural thing to do — and the leaked traffic starts *working*,
+silently bypassing the path it was supposed to take. **A leak that works is far
+more dangerous than one that fails.**
+
+Make the failure explicit rather than relying on routing:
+
+```sh
+iptables -P FORWARD DROP
+iptables -A FORWARD -o <intended egress> -j ACCEPT
+iptables -A FORWARD -i <intended egress> -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+```
+
+Whether these rules can be installed at all on the router is a separate,
+unprobed question — netfilter module availability is kernel configuration and
+rule insertion is capability policy, both of which sit in the "does not transfer"
+buckets. Confirm with the probes under
+[Linux Capabilities](#linux-capabilities-unverified) before relying on a design
+whose safety property depends on them.
+
+Verify in both states — down, confirming nothing leaks, then up again, confirming
+the ruleset did not also break the working case. A fail-closed ruleset that blocks
+the happy path is an easy mistake and only re-testing catches it.
+
+This is a separate concern from a health check. A health check notices the
+dependency is gone; it says nothing about what the data path does in the meantime.
+Both are needed.
+
+### Catch-All Rules Also Match the Return Path
+
+A wildcard route or policy rule installed for one direction of traffic generally
+matches the reverse direction too, and the reverse direction is the one nobody
+tests. A catch-all route in the container's own namespace can capture replies
+destined for the local network the container serves, sending return traffic back
+out the upstream path instead of to the host that asked. The symptom is one-way
+traffic, and the natural reading is that the far end is at fault.
+
+A narrow-selector version of the same configuration will not reproduce it, because
+the table then holds only specific destinations. So this failure mode appears the
+moment a requirement widens from "these destinations" to "everything" — worth
+re-testing the reverse direction whenever a selector, redirect, NAT rule or
+firewall default is broadened.
+
+### Verify a Modular Daemon's Loaded Modules, Not Its Files
+
+A plugin can be present in the image as a real shared object, with a config file
+saying `load = yes`, and still not load — an unmet transitive dependency (a
+crypto primitive from a package you did not install, for instance) is enough. The
+daemon's own `failed to load` lines are no help, because they typically list a
+dozen modules that were merely absent from the build, so the log looks
+noisy-but-normal while the one module your feature needs is silently missing. The
+symptom surfaces much later as a runtime failure in whatever the module was for.
+
+Start the daemon once during verification, capture the line where it enumerates
+what it loaded, and confirm the modules the feature needs are named there. `ls`
+on the plugin directory is a different test and will pass while the feature is
+dead. **Installed is not loaded, and loaded is not working** — each step needs
+its own check when a feature depends on optional modules.
+
 When a check fails, confirm the check itself is right before concluding the code
 is broken. Shell quoting in test payloads and hand-computed expected values are
 both easy to get wrong, and a false negative sends you looking for a bug that
@@ -639,12 +864,133 @@ does not exist.
 Beyond "no root access to NetCloud OS," this repo has no confirmed statement of
 which Linux capabilities a container actually receives — in particular whether
 `CAP_NET_RAW` (raw sockets, needed for tools like `ping`'s raw-socket mode,
-packet crafting with `trafgen`/`mausezahn`, or `tcpreplay`) is granted, dropped,
-or configurable via Compose `cap_add`/`cap_drop`. Any design that depends on
-raw sockets or other non-default capabilities should treat this as an open
-question and verify with a small probe (attempt to open a raw socket, check the
-result) before committing to a tool that needs it, rather than assuming from a
-package's documentation that it will work unprivileged inside `cpdockerengine`.
+packet crafting with `trafgen`/`mausezahn`, or `tcpreplay`) or `CAP_NET_ADMIN`
+(creating interfaces, adding addresses, routes and NAT rules inside the
+container's own network namespace) is granted, dropped, or configurable via
+Compose `cap_add`/`cap_drop`, and whether a `devices:` mapping such as
+`/dev/net/tun` is honoured. Any design that depends on raw sockets or other
+non-default capabilities should treat this as an open question and verify with a
+small probe before committing to a tool that needs it, rather than assuming from
+a package's documentation that it will work unprivileged inside
+`cpdockerengine`. Each probe is one command, and they run through
+`container exec` in any container already deployed:
+
+```sh
+python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_RAW, 1)'  # CAP_NET_RAW
+ip tuntap add dev probe0 mode tun && ip link del probe0                        # CAP_NET_ADMIN + /dev/net/tun
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE                           # netfilter modules + NAT
+iptables -t filter -P FORWARD DROP                                             # policy changes permitted
+cat /proc/sys/net/ipv4/ip_forward                                              # see the next section
+```
+
+The netfilter probes belong here rather than being assumed: **the availability of
+`iptables`/`nftables` modules is kernel configuration, and whether rules can be
+installed is capability policy.** Both fall in the "does not transfer" buckets
+above, so a NAT or firewall design that worked on a development machine has not
+been shown to work on the router — only that the rules and the logic are right.
+The probes need `iptables` in the image, so they need a purpose-built probe
+container rather than an existing deployment.
+
+Running the same probes under Docker Desktop proves only that the image and the
+kernel can do it. It says nothing about `cpdockerengine`, which is the engine in
+question, and nothing about user namespace remapping, which Docker Desktop does
+not apply by default. A capability is confirmed by a probe on the router and not
+before.
+
+### Preflight in the Real Container Instead of a Separate Probe
+
+When a container depends on non-default capabilities, device mappings or kernel
+state, put the probes in its own entrypoint rather than building a throwaway probe
+project. Check each grant at startup, log one `PREFLIGHT ok` / `PREFLIGHT FAILED`
+line per check naming the compose key that would fix it, and **refuse to start
+when a check fails** rather than proceeding into a half-working data path.
+
+This costs a few lines and collapses two artifacts into one: the first deployment
+of the real container answers every platform question from `container logs`, and
+the checks keep earning their place afterwards, because the same output
+distinguishes "the engine stopped granting this after a firmware upgrade" from an
+application fault. A separate probe container is still the right tool when the
+answer decides whether to write the real container at all.
+
+Order matters when a container installs the rules that enforce its own safety
+property: install them **before** starting the process whose traffic they govern,
+or there is a window during startup where traffic can take the path the rules
+exist to prevent. Netfilter accepts rules naming an interface that does not exist
+yet, so a firewall referring to an interface the daemon will create later can be
+installed up front.
+
+### Namespaced sysctls Are Readable but Not Writable
+
+`/proc/sys` is mounted read-only in the container, so `sysctl -w` fails with
+`permission denied` even for a namespaced key, and even with `CAP_NET_ADMIN` —
+while reading the same key works fine. The only lever is a Compose `sysctls:`
+entry, and whether `cpdockerengine` honours that is **UNVERIFIED**.
+
+This matters most for `net.ipv4.ip_forward`, which any container routing or
+NATing other hosts' traffic depends on. Because the container cannot change it,
+the value it already has decides whether such a design is possible at all — so
+read it early, as a go/no-go, rather than planning to set it during
+implementation:
+
+```bash
+container exec <name> cat /proc/sys/net/ipv4/ip_forward
+```
+
+**Observed on the router: `1`.** Read via `container exec` in an ordinary
+deployed container — no `cap_add`, no `sysctls:` entry, nothing special about
+that project — so IPv4 forwarding appears to be **enabled by default** for
+containers under `cpdockerengine`, and the read-only `/proc/sys` does not block a
+forwarding design. Model and firmware were not captured with the result, so treat
+it as "seen on at least one production router" rather than a guarantee across the
+fleet, and re-read it on the target device; it is one command.
+
+Note what this does *not* establish. Forwarding being permitted by the kernel for
+that namespace says nothing about whether `cap_add` and `devices:` are honoured,
+or whether netfilter rules can be installed — those need their own probes, above.
+
+The general shape applies to any kernel state a container cannot modify: the
+question is not "how do we set this" but "what is it already, and is that
+survivable".
+
+### Prefer the Implementation With the Smallest Privilege Surface
+
+Where a daemon offers both a kernel-facility implementation and a userspace one
+that needs nothing but a TUN/TAP device, default to the userspace path on this
+platform. It asks only for capabilities scoped to the container's own network
+namespace, it degrades predictably (slower) rather than mysteriously (`EPERM`
+deep inside third-party code), and it avoids the unverified question of what
+kernel state a remapped namespace is allowed to touch. Many network daemons ship
+such an implementation precisely because they get run in restricted containers
+elsewhere.
+
+A userspace data path also tends to encapsulate its traffic in UDP, which helps
+independently: containers on the default bridge sit behind the router's SNAT, and
+a protocol that is neither TCP nor UDP has no translatable header. Treat the
+kernel-facility path as an optimisation to confirm on hardware, not as the
+design.
+
+**Before switching implementations later, list what the current design depends on
+as an artifact of the present one.** Two implementations of the same capability
+are rarely interchangeable at the edges. A userspace data path typically produces
+a **named interface**, and firewall, NAT and MSS rules naturally get keyed on it
+(`-o <iface>`). The kernel equivalent may be **policy-based with no interface at
+all**, in which case every one of those rules matches nothing — and the failure is
+asymmetric in the worst way: the primary function still works, while a safety
+property such as fail-closed forwarding silently stops applying. Nothing looks
+broken.
+
+So "does the alternative work?" is usually the wrong question. The useful one is
+"does the alternative still produce everything my rules are keyed on?" Where it
+does not, either re-key the rules onto something the alternative does provide, or
+choose the variant of the alternative that restores the artifact — a routable
+tunnel interface rather than bare policy mode, for instance, which is typically a
+*further* kernel-config dependency on top of the base capability.
+
+Scope the performance claim honestly too. Moving a data path from userspace into
+the kernel removes a per-packet round trip; it is not hardware offload. The work
+still happens in software in the container's own namespace, so the gain is real
+but bounded, and a reader will assume the most favourable interpretation unless
+told what it is not.
 
 ### Side Effects of User Namespace Remapping
 

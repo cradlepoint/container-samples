@@ -1692,3 +1692,756 @@ they lead.
 - **State which case a partial guard closes and which it does not.** A guard
   documented without limits is read as complete, and the next person to extend
   the feature will assume the boundary is already defended.
+
+## 2026-08-18 — Answering a feasibility question by executing it
+
+No sample was built. The task was "can the router support a container that does
+X", followed by design questions about routing LAN traffic through such a
+container. Everything below was observed by running containers locally, not
+reasoned about, and the lessons are about verifying platform capability and
+testing containers that carry other hosts' traffic.
+
+### An assessment request still deserves an executed probe, built outside the repo
+
+- The user's framing was explicitly "don't write code". Answering from reasoning
+  alone would have produced a confident, plausible, partly-wrong answer — the
+  exact failure mode this file has recorded repeatedly. Building a throwaway
+  probe in `/tmp`, running it, reporting measured results, and deleting it
+  satisfies both: no code lands in the repo, and every claim in the answer has
+  an observation behind it.
+- **"Don't write code" is a constraint on the deliverable, not permission to
+  skip verification.** Work in a scratch directory outside the workspace, quote
+  real numbers and real log lines, then clean up and confirm `git status` is
+  clean. Say in the answer which parts were executed and which remain
+  inference — a feasibility answer's value is almost entirely in that
+  distinction.
+- Two rounds of this cost maybe forty minutes of container builds and converted
+  four separate "probably works" guesses into observations, including one
+  (`/proc/sys` being read-only) that changes the design.
+
+### Emulate the far end with a second container when the real peer is third-party equipment
+
+- For a container whose job is to speak a protocol to hardware nobody has on the
+  desk, standing up an open-source implementation of the **peer** role in a
+  second local container verifies the whole local stack end to end: module
+  loading, privileges, negotiation, and the data path. It costs one more compose
+  service and no hardware.
+- **State plainly which half of the interop question this settles.** It proves
+  "our container can do this"; it says nothing about "the vendor's box will
+  accept it", because both ends are then the same implementation. Presenting a
+  same-implementation test as interop evidence would be a new instance of the
+  standing "unverified claims presented as fact" failure. The residual risk
+  belongs in the answer as a list of specific settings to confirm on the peer.
+- For anything that forwards or routes on behalf of other hosts, use a
+  **three-container topology**: a client, the container under test, and the peer.
+  A two-container test only exercises traffic the container originates itself,
+  which is a different code path in the kernel (output vs forward) and misses
+  routing, NAT, and MTU behaviour entirely.
+
+### Control plane up is not data plane working
+
+- A session reported as `ESTABLISHED` proves negotiation and authentication
+  succeeded. It proves nothing about whether payload traffic transits. Both are
+  worth asserting separately: send real traffic, then read the byte and packet
+  counters on both sides to confirm the path taken is the one intended.
+- Exercise **TCP, not only ICMP**. ICMP passing shows routing and encapsulation
+  work; only a stateful protocol exercises connection tracking, and only a real
+  payload exercises MTU. Both bugs are invisible to `ping`.
+- Also verify the identity the far end *observes*, not just that it answered. In
+  a NAT design the peer sees a rewritten source address, and reading that on the
+  peer is what confirms the translation actually happened rather than being
+  bypassed by a route you did not notice.
+
+### A daemon's module can be present in the image and silently not load
+
+- A plugin shipped as a real `.so`, with a config file setting `load = yes`,
+  simply did not appear in the daemon's runtime module list. Nothing named it:
+  the daemon's own `failed to load` lines listed a dozen *other* modules that
+  were merely absent from the build, so the log looked noisy-but-normal. The
+  cause was an unmet transitive crypto dependency that another package provides,
+  and the symptom would have been an authentication failure at run time, long
+  after the build "succeeded".
+- **For any modular daemon, assert on the runtime loaded-module list, not on the
+  presence of files in the image.** Start it once during verification, capture
+  the line where it enumerates what it loaded, and check the modules the feature
+  needs are actually named there. `ls` on the plugin directory is not the same
+  test and will pass while the feature is dead.
+- Generalises to the family: **installed is not loaded, and loaded is not
+  working.** Each step needs its own check when a feature depends on optional
+  modules.
+
+### Package presence is not feature presence, and Alpine's build may omit what you need
+
+- The convention in this repo is a pinned Alpine base, and it is a good default.
+  But a package existing in Alpine does not mean Alpine's build of it includes
+  the optional module a design depends on — verified here by installing the same
+  package on three Alpine releases and finding the needed module absent from all
+  of them, while another distro shipped it in a separate package.
+- **Check the specific feature, not the package name, before committing to a
+  base image.** `apk add` the package in a throwaway container and list the
+  module directory. Doing this during design costs minutes; discovering it after
+  a sample is written costs the base-image decision.
+- When the feature genuinely only exists elsewhere, the options are a different
+  base or compiling from source with the module enabled. Either is a real
+  decision with a size cost — **measure both architectures and report the
+  numbers** rather than switching silently or quietly dropping the feature (the
+  standing Phase 2a rule about surfacing dropped capability applies to design
+  choices, not only to deletions).
+
+### Image size is a flash number; RSS is the memory number
+
+- Measured in the same run: a non-Alpine image at 121-132 MB (arm64) / 69 MB
+  (arm/v7), with the daemon's resident set at **4.4 MiB** with a session up. Two
+  orders of magnitude apart, and they answer different questions — the image
+  competes for the 6-14 GB of flash, the RSS competes for the 135 MB-1.84 GB
+  container memory allowance.
+- **Report both, and do not let an image size rule out a design on memory
+  grounds.** A 130 MB image that runs in single-digit megabytes is fine on the
+  smallest routers as far as memory is concerned; it is flash and pull time that
+  the size actually costs. `docs/memory-resources.md` previously presented image
+  size as the planning number for both.
+
+### Containers that forward traffic depend on a sysctl they may not be able to set
+
+- `/proc/sys` is mounted **read-only** in the container, so `sysctl -w` fails
+  even with `CAP_NET_ADMIN` — observed as `permission denied` on a namespaced key
+  whose value the container can read perfectly well. The only lever is a compose
+  `sysctls:` entry, and whether `cpdockerengine` honours that is unverified in
+  this repo.
+- The value it happens to default to therefore decides whether a forwarding
+  design is possible at all, which makes it a **go/no-go to probe first**, not a
+  detail to handle during implementation. Reading it costs one command in any
+  container already deployed.
+- **Answered same day, on hardware: `net.ipv4.ip_forward` is `1`.** The user ran
+  `container exec <name> cat /proc/sys/net/ipv4/ip_forward` against an ordinary
+  deployed container — no `cap_add`, no `sysctls:` entry — so forwarding is
+  enabled by default under `cpdockerengine` and the read-only `/proc/sys` does not
+  block a forwarding design. Model and firmware were not captured alongside the
+  result, which is the one thing that would have made it fleet-general rather than
+  "seen on at least one router"; **capture device model and firmware whenever a
+  probe result is recorded**, since without them the observation cannot be scoped
+  and has to be re-run on the next device anyway.
+- Worth noting how cheap this was: an open platform question that would otherwise
+  have been designed around got closed by one command the user could run in an
+  unrelated, already-deployed container. When a question is answerable that way,
+  ask for it early — it does not need a purpose-built probe container, and it beats
+  designing for both outcomes.
+- General shape worth recognising: when a design depends on kernel state the
+  container cannot modify, the question is not "how do we set it" but "what is it
+  already, and is that survivable". Answer that before designing around either
+  outcome.
+
+### Prefer the implementation with the smallest privilege surface
+
+- Where a daemon offers both a kernel-facility implementation and a userspace one
+  needing only a TUN/TAP device, the userspace path is the better default on this
+  platform: it asks only for capabilities scoped to the container's own network
+  namespace, it fails predictably (slower) rather than mysteriously (`EPERM` deep
+  inside third-party code), and it sidesteps the whole unverified question of what
+  kernel state a remapped namespace can touch.
+- A userspace data path also tends to encapsulate in UDP, which independently
+  matters here: containers on the default bridge sit behind the router's SNAT, and
+  a protocol that is neither TCP nor UDP has no translatable header.
+- Treat the kernel-facility path as an optimisation to confirm on hardware, not as
+  the design.
+
+### MTU and PMTUD deserve an explicit test whenever a container carries other hosts' traffic
+
+- A tunnel interface came up with a reduced MTU set automatically, and path MTU
+  discovery worked: the container emitted the ICMP that tells the sender to back
+  off, and the sender cached it. That is the good case, and it is worth confirming
+  rather than assuming, because the failure mode is small packets working and
+  large ones vanishing — which reads as an application bug, not a network one.
+- Test it deliberately with sizes above and below the tunnel MTU, with and
+  without the don't-fragment bit, and check whether the sender learns the path
+  MTU. Then clamp MSS anyway: the mechanism depends on ICMP that is filtered
+  often enough in real networks that relying on it is optimistic.
+
+### Search the config tree for the field you need, not the feature name you expect
+
+- Looking for static routes, a grep for the obvious path returned nothing, which
+  briefly read as "the platform lacks this" — the exact trap already recorded in
+  this file. The real path nests the concept under a differently-named parent.
+  Grepping for the **leaf field** rather than the feature name found it
+  immediately.
+- Refinement worth adding to that standing lesson: search for the *field* the
+  design needs (`gw`, `options`) rather than the *feature* it belongs to
+  (`static`, `dhcp_option`). Field names are stable across firmware and
+  vocabulary; the names of features and UI sections are not.
+- Also reconfirmed, in the direction the DTD *can* answer: a field's type tells
+  you a value is expressible, and nothing more. A permissive type is worth
+  reporting as "the config model allows this, untested on hardware" — never as
+  "this works".
+
+## 2026-08-18 (second entry) — Widening a requirement invalidated an earlier answer
+
+Continuation of the same feasibility work. The user narrowed one requirement and
+broadened another, and the broadened version exposed two failure modes the
+narrower design never touches. Everything below was observed by running it.
+
+### A requirement change can invalidate an earlier recommendation, and the reversal has to be said out loud
+
+- I had recommended one mechanism over another with a sound reason. When the scope
+  of the requirement widened, the reason evaporated and the rejected option became
+  the correct one. Carrying the earlier recommendation forward would have been
+  wrong, and quietly swapping it would have been worse — the user would have had a
+  contradiction in the transcript with no explanation.
+- **When a requirement changes, re-derive the earlier recommendations rather than
+  appending to them, and state plainly which ones reverse and why.** The reasoning
+  that produced advice is a function of the requirements it was given; changing an
+  input can flip the output without any new information about the platform.
+- Watch specifically for changes that **widen scope**: a subset becoming
+  everything, a narrow selector becoming a catch-all, one consumer becoming all
+  consumers. These do not just add load, they can change which mechanism is
+  correct and can activate whole failure modes that were previously unreachable.
+
+### A catch-all route in the container's own namespace captures its own return traffic
+
+- Widening a routing selector to a catch-all produced a policy rule of the form
+  "from all, look up this table", whose default route then also matched replies
+  destined for the *local* network the container serves. Return traffic was
+  routed into the upstream path instead of back to the requesting host. The
+  narrow-selector version of the same configuration cannot hit this, because the
+  table then contains only specific destinations.
+- **Any container that installs a catch-all route or a broad policy rule in its
+  own namespace should be tested in the reverse direction**, not only outbound.
+  The symptom is one-way traffic, and the natural reading is that the far end is
+  broken.
+- Generalises past routing: a wildcard rule added for one direction of traffic —
+  a redirect, a proxy rule, a NAT rule, a firewall default — usually also matches
+  the return path, and the return path is the one nobody tests.
+
+### Test the dependency-down state, and prefer fail-closed
+
+- With the upstream path deliberately torn down, the container's routing fell
+  back to its ordinary default route and it forwarded other hosts' traffic
+  straight out in cleartext. Counted it: real packets, real egress interface,
+  while everything still looked healthy.
+- Worse than the leak itself is how it interacts with a later well-meaning
+  change: those packets get no replies only because the NAT rule is scoped to the
+  intended egress interface. Add a broader NAT rule during troubleshooting — an
+  entirely natural thing to do — and the traffic starts *working*, silently
+  bypassing the path it was supposed to take. **A leak that works is far more
+  dangerous than a leak that fails**, because nothing looks wrong.
+- **For any container that forwards, proxies or relays other hosts' traffic
+  through a conditional path, verify the behaviour with that path down.** Then
+  make the failure explicit: default-deny forwarding and allow only the intended
+  egress plus the conntrack return direction. Verify in *both* states — down (no
+  leak) and up (still works) — because a fail-closed ruleset that also blocks the
+  working case is an easy mistake and it is only caught by re-testing the happy
+  path afterwards.
+- This is a distinct gate from a health check. A health check notices the
+  dependency is gone; it does nothing about what the data path does in the
+  meantime. Both are needed and neither substitutes for the other.
+
+### Assert at the endpoint that matters, not at the middlebox
+
+- The intermediate component's own counters showed traffic flowing in both
+  directions while the client at the edge saw 100% loss. Both readings were
+  accurate: packets really did traverse the middle and really did come back, then
+  went somewhere other than the client. Trusting the middlebox's counters would
+  have sent me looking at the far end for a fault that was one hop away.
+- **A component's own statistics are evidence about that component, not about the
+  end-to-end path.** Assert success at the endpoint that actually consumes the
+  service, and use intermediate counters to localise a failure once the endpoint
+  says something is wrong. This is the same lesson as "do not trust a system's
+  own diagnosis of itself", arriving through counters instead of log messages.
+
+### Counters are cumulative; zero them or compare deltas
+
+- I briefly read a rule's packet counter as evidence of a new leak when the count
+  was left over from the previous phase of the same test. **When counters are the
+  evidence, reset them at the start of each phase or record the value before and
+  after and reason about the delta.** An absolute number carries no information
+  about which phase produced it.
+- Belongs to the standing "verify the check before suspecting the code" family:
+  the measurement instrument was fine, my reading of it was not, and it would have
+  produced a confidently wrong finding.
+
+### A compound shell block can silently not run while printing plausible output
+
+- A multi-step verification block containing `#` comment lines was mangled by the
+  shell: none of the steps ran, and the output looked like a replay of the
+  previous command, which read as though the steps had executed. I only caught it
+  by inspecting the resulting state (`ip route`, `iptables -S`) and finding
+  nothing had changed.
+- **Keep inline comments out of compound shell blocks, and make each step echo a
+  unique marker**, so a missing marker proves a step was skipped. Then verify the
+  *state* the block was supposed to produce rather than reading its output as
+  proof.
+- Same family as the existing rule about scripted multi-site edits needing a
+  match-count assertion: a script's output is not evidence that its steps ran, and
+  plausible-looking output is the worst case because it stops you checking.
+
+## 2026-08-18 (third entry) — Recording a result the user obtained
+
+Tiny task: the user ran one probe command on their router and pasted the result,
+which closed a platform question this file had opened the same day. The result
+itself is recorded above, next to the entry that framed it as unknown. What
+follows is about handling an incoming result, which is its own small discipline.
+
+### A positive result invites over-reading, so enumerate what it does not close
+
+- The observation settled one specific question. Adjacent questions that feel like
+  the same question — whether the engine grants the capability the design also
+  needs, whether a device mapping appears, whether related rules can be
+  installed — were untouched by it, because they are decided by a different
+  mechanism (what the engine grants) than the one the probe exercised (what the
+  kernel permits in that namespace).
+- **When a probe comes back positive, write down what it does not establish in the
+  same breath as what it does.** A bare "confirmed" gets read as clearance for
+  everything nearby, and the next reader has no way to tell which adjacent claims
+  were checked. This is the mirror of the already-recorded trap of generalising one
+  verb's tested behaviour to its untested siblings — same failure, arriving through
+  a success rather than through a doc consolidation.
+- Practical form: name the mechanism the probe actually exercised. If the remaining
+  questions turn on a *different* mechanism, that is the sentence that stops the
+  over-generalisation.
+
+### Capture device model and firmware with every probe result
+
+- The result arrived without them, and that is the single thing that would have
+  made it general rather than "seen on at least one router". Without model and
+  firmware the observation cannot be scoped, so the next device needs the probe
+  re-run regardless — which wastes most of the value of having run it.
+- This repo already does it well elsewhere (an earlier probe result is recorded as
+  R980 / NCOS 7.26.21, and that is why it is still quotable). **Ask for model and
+  firmware alongside any result before recording it**, or record the gap explicitly
+  so nobody reads the entry as fleet-wide.
+
+### When a claim's status changes, sweep for every place that framed it as open
+
+- Converting an UNVERIFIED item to observed means editing more than the page that
+  stated it. A leftover paragraph saying "this is unknown, probe it first" reads as
+  current, and its consequence is worse than a stale wrong fact: it invites someone
+  to re-run settled work, or to design around a limitation that has been
+  disproved — the exact cost this file has already documented for untested claims.
+- **The token grep is not enough.** Searching for the setting's name did not match
+  the paragraph that was entirely about that setting, because the prose referred to
+  it by description rather than by name. I found it only by searching for a phrase
+  from the surrounding argument. So sweep for the *concept* — headings, synonyms, a
+  distinctive phrase from the claim — not just the identifier, or the sweep returns
+  a false all-clear. Same family as the standing rule that a zero-result search is
+  evidence about the query rather than the corpus.
+
+### The cheapest probe is often reading state somewhere that already exists
+
+- Recorded in full next to the result above, but worth stating on its own because
+  it applies before any probe container gets written: an open question about the
+  platform may be answerable by reading state in a container that is *already
+  deployed* for some unrelated purpose. That is one command and no build, versus
+  authoring, pushing and deploying a probe project.
+- Check that first. A purpose-built probe container is the right tool when the
+  question needs a capability, a device mapping, or a package the existing
+  containers do not have — not when it needs a file read.
+
+## 2026-08-18 (fourth entry) — Testing a kernel-feature question on the wrong machine
+
+User correction, and a real category error on my part. Recorded because the
+reasoning that led to it is written down in this repo and reads as permission.
+
+### Kernel feature availability does not transfer from the development machine
+
+- Asked whether a kernel networking facility was usable from a container, I
+  probed it **locally under Docker Desktop** and reported the result. One feature
+  was reported as unavailable ("Unknown device type") and two as available. All
+  three findings are facts about Docker Desktop's **linuxkit VM kernel** and say
+  nothing whatever about the router's kernel, which is a different build with a
+  different `CONFIG_*` set.
+- **A local kernel result is unsafe in both directions**, which is what makes this
+  worse than a merely useless test: absent locally invites dropping a design that
+  the router would support, present locally invites shipping one that fails at
+  deploy. I was one step away from telling the user a facility "isn't available"
+  on the strength of a VM kernel's config.
+- The class is wider than one subsystem: anything reached through
+  `ip link add ... type <x>`, kernel IPsec/XFRM, tunnel drivers, netfilter
+  modules — anything whose existence depends on a kernel build option. **These
+  questions are answerable only by `container exec` on the router.**
+
+### The misleading sentence was in this repo's own guide, and it was mine to notice
+
+- `docs/container-development-guide.md` said engine differences matter, then added
+  that "kernel-level behaviour such as how PID 1 receives signals inside a
+  container also transfers, since that's a property of Linux namespaces rather
+  than of Docker Engine specifically." That is true and it is also exactly the
+  sentence I over-generalised: from *namespace semantics transfer* to *kernel
+  behaviour transfers*, and from there to *kernel feature availability transfers*.
+- Fixed by replacing the prose with three explicit buckets — transfers (image
+  contents, application logic, namespace semantics), does not transfer (kernel
+  configuration), does not transfer (engine and namespace policy: what `cap_add`
+  grants, whether `devices:`/`sysctls:` are honoured, userns remapping effects).
+  A reader now has to place a result in a bucket rather than infer from an example.
+- General lesson about documentation of this kind: **a doc that says "X transfers"
+  with one example invites the reader to extend the category by resemblance.**
+  Where the boundary matters, enumerate what is *outside* it too. One worked
+  example plus a general-sounding justification is how a correct sentence becomes
+  a wrong inference.
+
+### Momentum is not a reason to keep using the same instrument
+
+- The honest cause was not ignorance of the distinction — this file already
+  contains "the engine itself differs" and "when the development machine is more
+  permissive than the target, a passing local check is weaker evidence than it
+  appears". It was that several previous questions in the same session *were*
+  legitimately answerable locally (image contents, plugin loading, application
+  behaviour, netfilter rule syntax), so reaching for the same harness again
+  required no thought.
+- **When a new question arrives mid-session, re-ask which machine can answer it
+  rather than reusing the harness that answered the last one.** The cost of
+  getting this wrong is not a wasted test, it is a confident answer about the
+  wrong system, delivered with measured output attached — which is far more
+  persuasive than a guess and therefore far more damaging.
+- Cheap guard, worth applying before any local run: name the thing the result
+  would be a property of. If the answer is "this kernel" or "this engine" rather
+  than "this image" or "this code", the development machine cannot answer it.
+
+### Retract, do not soften, a result obtained the wrong way
+
+- The right response to the correction was to withdraw the findings outright
+  rather than keep them with a caveat attached. A caveated wrong-machine result
+  still anchors the design discussion, and in a transcript it will be read later
+  as evidence with a footnote. Withdrawing it and naming the one-command probe
+  that *would* settle the question leaves the reader in a better position than a
+  hedge.
+
+### Addendum to the fourth entry — two things the correction exposed downstream
+
+Recorded separately because both are about handling a correction rather than about
+the mistake itself, and both apply to any future session.
+
+- **A repeated caveat stops working as a warning, including for the person writing
+  it.** Several answers in that session carried "verified locally, not on
+  `cpdockerengine`" and the qualifier was accurate every time. That is what made it
+  dangerous: attaching it began to feel like managing the risk, when for one
+  question the caveat's real job was to stop the local test being run at all. **A
+  standing disclaimer is not a substitute for deciding, per question, which machine
+  can answer it.** If a caveat appears in every answer, it has stopped carrying
+  information — treat that as a signal to re-derive the judgement it was standing
+  in for.
+- **After writing down a new distinction, sweep your own earlier claims in the same
+  session against it.** Applying the new three-bucket rule retroactively caught two
+  claims I had already made and presented as settled: that netfilter/NAT rules
+  install and behave correctly, and that a TUN device can be created — both of
+  which are kernel-configuration and capability-policy questions, not properties of
+  the image. The design reasoning built on them survives; the platform claims do
+  not. Fixed by adding the netfilter probes to the router probe list and marking
+  the fail-closed pattern's availability as unprobed where it is documented.
+  Writing a rule and leaving your own prior output unaudited against it is the
+  documentation equivalent of fixing a bug without checking the sibling call paths.
+
+## 2026-08-18 (fifth entry) — First build of a container that carries other hosts' traffic
+
+A sample was actually written and run this time. The findings below came out of
+testing it rather than designing it, and the first one is a defect I shipped into
+the first build and only found by inducing a failure the daemon's own recovery did
+not cover.
+
+### An off-the-shelf daemon's reconnection is several mechanisms, each with its own trigger
+
+- The daemon offered three recovery options and I enabled all three, which read as
+  comprehensive. They are not the same mechanism: one fires at configuration load,
+  one only when the **peer** closes the session, one only when a liveness check
+  concludes the peer is dead. Tearing the session down administratively — none of
+  those three routes — left it down **permanently**, with the container reporting
+  perfectly healthy because its main process was alive and its config was loaded.
+- For a container whose entire purpose is maintaining that session, and especially
+  one that fails closed, that is an indefinite outage waiting for a human.
+- **Enumerate which trigger each recovery option responds to, then test by inducing
+  a teardown outside that set.** Blocking traffic or killing the peer exercises the
+  liveness path, which is the one most likely to already work; an administrative
+  teardown is the case that finds the gap. Fix by adding a watchdog keyed on
+  **observed session state** rather than on the daemon's notion of failure.
+- Generalises to anything holding a long-lived session — broker connections,
+  replication streams, media pullers. "It reconnects" is a claim about specific
+  triggers, not about all failures.
+
+### Do not make an unverified engine behaviour part of the recovery design
+
+- The obvious alternative to a watchdog was to let the health check mark the
+  container unhealthy and have the engine restart it. `docs/container-development-guide.md`
+  stated flatly that after `retries` failures "the container is restarted" — with
+  no evidence cited, and plain Docker Engine does **not** do this (it only marks
+  the container unhealthy; restart-on-unhealthy is Swarm behaviour). Building
+  recovery on that sentence would have produced a container that silently never
+  recovers.
+- Corrected the doc to mark it UNVERIFIED and to say what a health check is good
+  for: a status signal, not a recovery mechanism. **Recovery belongs inside the
+  container**, where it depends only on code we control. Keep the health check for
+  visibility, and keep exiting non-zero when the main process dies, since the
+  restart *policy* is documented behaviour.
+- General rule: before a design leans on a platform behaviour, check whether the
+  claim describing it cites evidence. An unattributed flat assertion in this repo's
+  own docs is exactly the failure mode already recorded here several times, and it
+  is most dangerous where it silently substitutes for something you would otherwise
+  have built.
+
+### Put the platform probes in the real container, not a separate probe project
+
+- I had been offering to build a throwaway probe container to settle which
+  capabilities and devices the engine grants. Putting those checks in the real
+  container's entrypoint was strictly better: one artifact instead of two, the
+  first deployment answers every open platform question from `container logs`, and
+  the checks keep paying off afterwards — the same output distinguishes "a grant
+  was withdrawn by a firmware upgrade" from an application fault.
+- Shape that worked: one line per check, `PREFLIGHT ok` / `PREFLIGHT FAILED`,
+  each failure naming the compose key that would fix it, then **refuse to start**
+  rather than proceeding into a half-working data path. A container that half-works
+  is harder to diagnose than one that will not start and says why.
+- A separate probe container is still right when the answer decides whether the
+  real container gets written at all. It is the wrong tool once you are writing the
+  real thing anyway.
+
+### Install a safety property before the thing it protects exists
+
+- The fail-closed firewall goes in **before** the daemon starts, not after it
+  connects. Installing it afterwards leaves a startup window in which forwarded
+  traffic takes exactly the path the rules exist to prevent. Netfilter accepts
+  rules naming an interface that does not exist yet, so rules referring to an
+  interface the daemon will create later can be installed up front — which is what
+  makes the safe ordering possible at all.
+- General: when a container installs the rules enforcing its own guarantee, the
+  guarantee holds only from the moment the rules exist. Order the entrypoint so
+  that moment precedes any traffic.
+
+### Keep test tooling out of the image under test
+
+- The image deliberately ships no `ping` or `nc`, which is correct and also meant
+  the obvious test commands were unavailable. Rather than adding tools to the
+  production image, use a minimal separate image for the client role, and attach a
+  tool container **into another container's network namespace** with
+  `--network container:<name>` when a listener or capture is needed inside the
+  namespace under test.
+- Worth knowing as a technique: it gives full tooling inside a namespace without
+  changing the artifact being verified, so what was tested is what ships.
+
+### Verify a reused harness is running what you think it is
+
+- A test runner reused an existing background process for a new container run
+  (`isReused: true`) after I had removed the container that process was managing.
+  The run therefore executed nothing, and my next check reported "no SA" — which
+  read exactly like the watchdog failing. I nearly went looking for a bug in code
+  that had never run.
+- **When a harness reuses a session, process or cached environment, confirm it is
+  running the current command before reading its output as a result.** Same family
+  as the standing rule about verifying the check before suspecting the code, and as
+  the earlier finding that a compound shell block can silently not run while
+  printing plausible output. A false negative from a harness is more expensive than
+  from a test, because nothing about it looks like a harness problem.
+
+### One-name rule: grep for both separators, not just the one you chose
+
+- The sample is named with underscores throughout, and I still nearly shipped a
+  generated file inside the image whose name used a hyphen. Caught by grepping for
+  both separator variants and counting occurrences, which took one command and
+  turned "I was consistent" into a number.
+- Cheap, mechanical, and worth doing before finishing any sample:
+  `grep -rho 'name[_-]variant' . | sort | uniq -c` should show a single row.
+
+## 2026-08-18 (sixth entry) — A truncated search became a platform limitation
+
+The user asked a clarifying question about which of two mechanisms the design
+used. Answering it properly meant re-reading the config tree, which produced a
+capability I had spent several turns implicitly asserting did not exist. Nothing
+was built; the lesson is about how the wrong answer got established.
+
+### `head` on an exploratory search manufactures platform limitations
+
+- Earlier in the session I listed a config subtree with
+  `grep -n '^- `config/<subtree>' PATHS.md | head -40`, read the 40 lines, and
+  reasoned from them as though they were the subtree. The entry that answered the
+  question sat a few hundred lines further down, inside the same subtree, and was
+  removed by the pipe. I then told the user, across more than one turn, that the
+  platform could not do something it can do.
+- **A truncated result reads exactly like a complete one.** There is no marker in
+  the output saying "there was more", so the conclusion drawn from it feels as
+  well-founded as one drawn from a full read. This is the sibling of the standing
+  lesson that a zero-result search is evidence about the query rather than the
+  corpus: a *truncated* result is evidence about the pager, not the corpus.
+- Practical rule, now in the workflow: **count before reading** (`grep -c`), then
+  read every match, or narrow the pattern until the whole result set fits. Reserve
+  `head` for output you already know the shape of, never for "does this exist".
+  Config path indexes are the worst case, because one subtree's entries can span
+  hundreds of lines and the interesting leaf is rarely near the top.
+
+### Choosing mechanism B because A "cannot work" is a limitation claim in disguise
+
+- The repo already gates workarounds justified by "the platform cannot do X". This
+  was the same claim wearing different clothes: not a workaround, just a
+  recommendation of one mechanism over another, resting entirely on an untested
+  assertion that the other could not be scoped the way the design needed.
+- It is easier to miss than a workaround, because the result looks like an ordinary
+  design choice. There is no extra dependency, no odd architecture, nothing that
+  invites "why is this here?". The gate has been widened to name it explicitly.
+- Tell of this failure worth watching for in your own output: a sentence of the
+  form "X can't express Y, so we use Z". That is a capability claim, and it needs
+  a search behind it before it goes in a recommendation, a README, or a comment
+  someone will copy.
+
+### A reversal has more than one trigger, and each needs saying out loud
+
+- A rule was added earlier in this session to re-derive recommendations when a
+  *requirement* changes. This reversal had a different cause: the requirements were
+  unchanged and **new information about the platform** arrived. Both produce the
+  same hazard — advice in the transcript that is no longer correct — and both need
+  the same handling: state which earlier answer reverses and why, rather than
+  quietly substituting the new one.
+- Worth generalising the trigger list rather than the rule: requirements changed,
+  platform knowledge changed, or a measurement came back different. Any of the
+  three invalidates conclusions downstream of it, and the older and more confident
+  the original statement, the more important it is to name it as superseded.
+
+### A clarifying question is a prompt to re-verify the excluded option
+
+- The user's question was neutral — "is it A or B?" — and the useful response was
+  not to restate the choice but to re-check the basis on which the other option had
+  been dropped. That re-check is what surfaced the error.
+- **Treat "so is it A or B?" as an invitation to re-audit why the loser lost.** A
+  question about a decision is the cheapest moment to catch a bad premise
+  underneath it, and it costs one search. Restating the conclusion confidently is
+  the failure mode, because the question sounds like it wants a summary.
+
+## 2026-08-18 (seventh entry) — Swapping implementations can void a safety rule silently
+
+A question-only turn: whether an alternative implementation of a capability was
+usable instead of the one the sample uses. Nothing was built and nothing was
+tested — the answer depended on kernel configuration and namespace policy, which
+only a probe on the router can settle. One genuinely new general lesson came out of
+working through what switching would actually cost.
+
+### A safety rule keyed on one implementation's artifact matches nothing under another
+
+- The container's whole data plane — the fail-closed forwarding accepts, the NAT
+  rule, the MSS clamp — is keyed on a **named interface** that the current
+  implementation happens to create. The alternative implementation of the same
+  capability is policy-based and produces **no interface at all**. Every one of
+  those rules would match nothing.
+- What makes this dangerous is the asymmetry: **the primary function keeps working
+  while the safety property silently stops applying.** Traffic still flows, the
+  session still establishes, logs look normal — and the guarantee the rules existed
+  to provide is gone. Nobody would notice until the failure the guarantee was for
+  actually happened.
+- **Record what each safety rule is keyed on**, alongside the rule. Interface
+  names, device paths, process names, log message formats are all artifacts of a
+  particular implementation, and any of them can disappear in a swap that looks
+  like a pure performance change.
+- Generalises beyond firewalls: a health check keyed on a process name, monitoring
+  keyed on a log string, a supervisor keyed on a PID file. Same shape — the thing
+  being observed is incidental to the implementation, not intrinsic to the
+  capability.
+
+### "Does the alternative work?" is usually the wrong question
+
+- The useful question is **"does the alternative still produce everything my design
+  is keyed on?"** A capability comparison naturally focuses on whether the
+  alternative provides the capability, which is the part most likely to be fine,
+  and skips the edges where the design has accumulated incidental dependencies.
+- Where it does not, there are two honest options: re-key the rules onto something
+  the alternative does provide, or pick the *variant* of the alternative that
+  restores the artifact. Note that the variant is often a further dependency on top
+  of the base capability rather than a free choice — so a swap that looked like one
+  unknown turns out to be several, and saying so is more useful than a yes.
+- Practical habit: before evaluating a swap, grep the entrypoint and compose for
+  the artifact's name. The count of hits is the size of the change nobody costed.
+
+### Scope a performance claim by what it is not
+
+- Moving a data path from userspace into the kernel removes a per-packet round
+  trip. It is **not** hardware offload — the work still happens in software in the
+  container's own namespace. Stating the bound explicitly matters because a reader
+  will otherwise assume the most favourable interpretation available, and "kernel"
+  reads as "fast" to most people.
+- Same discipline as the standing rule about enumerating what a positive probe
+  result does *not* establish, applied to performance instead of capability.
+
+### The guard from the fourth entry fired
+
+- That entry's rule — before running a local experiment, name the thing the result
+  would be a property of, and if the answer is "this kernel" or "this engine" then
+  the development machine cannot answer it — worked as written. The question this
+  turn was of exactly that shape and the rule stopped the test before it was run.
+- Worth recording that a rule in this file has now been exercised rather than only
+  written. A guard that has actually caught the case it was written for is worth
+  more than one that has only ever been asserted, and knowing which is which helps
+  the next reader decide how much weight to give an entry.
+
+## 2026-08-18 (eighth entry) — Built an integration against an assumed peer configuration
+
+The user pasted the real configuration of the equipment the container integrates
+with, and it contradicted an assumption the sample had been built on. Everything
+below is about how that assumption survived long enough to be written into code.
+
+### Ask for the peer's actual configuration before writing the integration
+
+- The sample hardcoded one authentication method for the remote end. The real
+  device uses a different one entirely — there was no shared secret to use, so the
+  container as shipped could not have completed authentication against it.
+- Nothing exotic caused this. **The configuration was available for the asking the
+  entire time and I never asked for it.** Several turns were spent reasoning about
+  what the peer probably required, when one request would have settled every
+  parameter at once: authentication method, identities, proposals, traffic
+  selectors, address assignment, timers.
+- **For any container that integrates with third-party equipment, obtaining that
+  equipment's configuration dump is a Phase 1 input, not a nice-to-have.** Ask for
+  the config itself, not a description of it — a description carries the sender's
+  own summary of what matters, and the parameter that breaks the integration is
+  usually one neither party thought to mention.
+- Corollary for local testing: a peer emulator configured from *my* assumptions
+  verifies the container against those assumptions. That looks like end-to-end
+  verification and is worth far less, because it passes while the real integration
+  cannot connect. Configure the emulator from the real peer's config.
+
+### A working client config for the same peer is a specification
+
+- Alongside the device config came a working phone profile for the same gateway.
+  It independently confirmed the authentication shape and the expected peer
+  identity, and one of its properties settled a question the device config left
+  ambiguous — the profile carried no trust anchor of its own, which could only mean
+  the peer's certificate chains to a publicly trusted CA.
+- **Ask whether a client that already connects to this peer exists, and get its
+  configuration.** It has been proven against the live system, which no amount of
+  reading the server config gives you, and it is usually shorter and more explicit
+  about the client-side choices you actually have to make.
+- Read it for what it *omits* as well as what it sets. An absent section is
+  frequently the most informative part, because it means the default applied and
+  the peer accepted it.
+
+### A partial answer to a multi-part question is not confirmation of the whole
+
+- Earlier I listed several things to confirm about the peer. The user confirmed
+  one of them, precisely and helpfully. I then proceeded as though the list had
+  been answered, and built on the remaining assumptions — including the one that
+  turned out to be wrong.
+- **The confirmed item is the confirmed item.** A partial answer reads as agreement
+  with the whole question, especially when the answer arrives in the affirmative
+  and the question was phrased as a bundle. Restate what remains open rather than
+  letting silence become consent.
+- Practical habit: keep the open-questions list explicit across turns and re-state
+  the remainder each time one is closed. It costs a sentence and it is the same
+  discipline already recorded for probe results — enumerate what an answer does
+  *not* establish. This entry is that lesson arriving from a human answer instead
+  of a machine one, which is the direction that is easier to miss, because a person
+  answering feels like the question was handled.
+
+### Exercise the PKI path, not just the shared-secret path
+
+- Adding certificate support meant the certificate code path needed a real chain to
+  run against. Generating one locally — a CA and a server certificate with the
+  right identity, using the daemon's own tooling in a throwaway container — took a
+  few commands and turned an unexecuted branch into a verified one, including trust
+  anchor loading, chain validation and identity matching.
+- **Where an integration supports both a secret-based and a certificate-based mode,
+  test both.** The secret path is the easy one to stand up locally, so it is the one
+  that gets tested, and the certificate path then ships never having run. Issuing a
+  throwaway chain is cheap enough that there is no excuse for the asymmetry.
+
+### Defaults copied from a working example can encode the example's assumptions
+
+- One parameter had to be *absent* to match the peer, not present — the peer had a
+  feature disabled that most examples enable, and including the corresponding
+  option makes the second negotiation stage fail while the first still succeeds.
+- Two general points. **A partially successful handshake localises the fault**: the
+  stage that failed names the configuration section to look at, so "stage one fine,
+  stage two fails" is information, not just a failure. And **a default lifted from a
+  working example carries that example's peer assumptions**; where a setting must
+  match the other side, say so in the comment next to the default, because the
+  failure it causes does not look like a proposal mismatch.

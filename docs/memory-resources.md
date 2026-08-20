@@ -68,6 +68,21 @@ An Alpine plus Python container of this shape runs comfortably under a
 what makes the AER2200 and IBR1700 floor of 135 MB the real constraint for
 heavier workloads.
 
+### Image size and memory use are different numbers
+
+Image size is a **flash** cost (and a pull-time cost over a possibly metered
+WAN). Resident memory is what competes with router services for the allowance in
+the table above, and the two can be orders of magnitude apart. Measured in one
+run: a Debian 12-slim based image carrying a network daemon plus its optional
+plugin packages came to 121-132 MB on `linux/arm64` and 69 MB on `linux/arm/v7`,
+while the daemon's resident set with a session established was **4.4 MiB**.
+
+So a large image does not by itself rule a design out on memory grounds — report
+both numbers, from `docker image ls` and `docker stats` respectively, and judge
+each against the constraint it actually consumes. A non-Alpine base is still worth
+avoiding where Alpine can do the job, but the reason is flash and pull time, not
+the memory floor.
+
 ## Key Takeaways for Container Development
 
 - **AER2200/IBR1700**: Very constrained (135-460 MB). Use minimal base images (Alpine). Avoid heavy runtimes.

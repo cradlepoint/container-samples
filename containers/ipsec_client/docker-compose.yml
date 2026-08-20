@@ -1,0 +1,38 @@
+# Local development compose. For the router, use docker-compose.cradlepoint.yml.
+services:
+  ipsec_client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/arm64
+    platform: linux/arm64
+    container_name: ipsec_client
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - VPN_GATEWAY=always-on.vpn.example.com
+      - VPN_GATEWAY_AUTH=pubkey
+      - VPN_GATEWAY_ID=always-on.vpn.example.com
+      - VPN_USERNAME=change-me
+      - VPN_PASSWORD=change-me
+      - LAN_SUBNETS=192.168.0.0/24
+      - VPN_DATA_PATH=auto
+    mem_limit: 128M
+    healthcheck:
+      # CMD-SHELL because this needs a pipe. Reports unhealthy whenever no
+      # CHILD_SA is installed, which is the state that matters -- charon being
+      # alive says nothing about whether the tunnel is up.
+      test: ["CMD-SHELL", "swanctl --list-sas 2>/dev/null | grep -q INSTALLED"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

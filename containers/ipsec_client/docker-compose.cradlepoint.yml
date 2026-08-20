@@ -1,0 +1,108 @@
+# Cradlepoint NCOS Compose for ipsec_client.
+#
+# Build this sample's own Dockerfile and push it where the router can pull it.
+# Do not point image: at a third party's repository:
+#
+#   docker buildx build --platform linux/arm64  -t yourregistry/ipsec_client:latest --push .
+#   docker buildx build --platform linux/arm/v7 -t yourregistry/ipsec_client:latest-armv7 --push .
+#
+# Paste into: System > Containers > Projects > Add > Compose tab in NetCloud
+# Manager, after replacing the image and the values under environment:.
+#
+# LAN clients must be able to reach this container by IP, so it needs an address
+# on a real LAN segment -- the default 172.17.x bridge will not do. The network
+# below binds to an existing NCM Local IP Network by UUID; subnet and gateway
+# must match that network's configuration exactly.
+#
+# Then get LAN traffic to it. For a full tunnel, prefer source-based policy
+# routing on the router: a table in config/routing/tables holding 0.0.0.0/0 via
+# the ipv4_address below, selected by a config/routing/policies entry matching
+# the LAN as src_ip_network. That leaves the router's own default on the WAN,
+# which the container needs for its ESP packets, and requires no client-side
+# change. DHCP option 3 (config/lan/dhcpd/options, option 3 = this container's
+# address, options_enabled true) is the alternative and avoids a hairpin through
+# the router, but only reaches DHCP clients.
+#
+# Do not put a default route in the router's Main table pointing here: that
+# captures the router's own traffic, including this container's ESP to the
+# gateway, which then loops straight back.
+#
+# Either way, also set DHCP option 6 (DNS) to a resolver reachable through the
+# tunnel, or client DNS keeps going out the WAN -- see README.
+version: "2.4"
+services:
+  ipsec_client:
+    image: "yourregistry/ipsec_client:latest"
+    container_name: ipsec_client
+    restart: unless-stopped
+    # NET_ADMIN is needed to create the TUN device, add the policy routing rule
+    # and install the NAT and fail-closed firewall rules. The entrypoint
+    # preflights each of these and refuses to start with a partial data path,
+    # so check `container logs ipsec_client` for the PREFLIGHT lines first.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      lan:
+        ipv4_address: 192.168.0.2
+    environment:
+      - VPN_GATEWAY=always-on.vpn.example.com
+      # How the GATEWAY authenticates itself. FortiGate dialup with EAP usually
+      # uses a certificate (`authmethod: signature` with a `certificate:` entry
+      # and no psksecret) -- that is pubkey here. Use psk only if the gateway
+      # really has a psksecret. This side always authenticates with EAP.
+      - VPN_GATEWAY_AUTH=pubkey
+      # Must match what the gateway presents: normally the FQDN in its
+      # certificate's SAN, which is the same value a working iOS/Android profile
+      # puts in RemoteIdentifier. If the gateway sets a `localid`, it may send
+      # that instead -- the log names what it received on a mismatch.
+      - VPN_GATEWAY_ID=always-on.vpn.example.com
+      # Pin the issuing CA (base64 of the PEM, single line):
+      #   base64 -w0 ca.pem
+      # Omit to fall back to the system trust store, which accepts any publicly
+      # trusted CA that issued a certificate for VPN_GATEWAY_ID. Pinning is
+      # strictly stronger; the container logs which one it used.
+      # - VPN_CA_CERT_B64=LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t...
+      # - VPN_PSK=only-needed-when-VPN_GATEWAY_AUTH=psk
+      - VPN_USERNAME=change-me
+      - VPN_PASSWORD=change-me
+      # eap-mschapv2 covers FortiGate with a local or RADIUS/FortiAuthenticator
+      # user group. If the gateway negotiates something else, set it here --
+      # eap-gtc, eap-md5, eap-tls and eap-ttls are all available in the image.
+      - VPN_EAP_METHOD=eap-mschapv2
+      # Match the gateway's phase 1 and phase 2. Note the ESP proposal carries
+      # no DH group: FortiGate phase 2 with `pfs: disable` will not match one.
+      - VPN_IKE_PROPOSALS=aes256-sha256-modp2048
+      - VPN_ESP_PROPOSALS=aes256-sha256
+      # Kernel ESP with an XFRM interface when the kernel supports it, userspace
+      # over TUN when it does not. The log says which was selected.
+      - VPN_DATA_PATH=auto
+      # Every LAN subnet whose clients route through this container. Replies to
+      # these are forced onto the main routing table; without that, a full
+      # tunnel swallows the return path and clients see one-way loss.
+      - LAN_SUBNETS=192.168.0.0/24
+      # Full tunnel. Narrow this to specific remote subnets for a split tunnel.
+      - VPN_REMOTE_TS=0.0.0.0/0
+      # Leave at 1. With 0, LAN traffic falls back to the router and leaves
+      # unencrypted whenever the tunnel is down.
+      - VPN_FAIL_CLOSED=1
+    mem_limit: 128M
+    healthcheck:
+      test: ["CMD-SHELL", "swanctl --list-sas 2>/dev/null | grep -q INSTALLED"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+
+networks:
+  lan:
+    driver: bridge
+    driver_opts:
+      com.cradlepoint.network.bridge.uuid: "00000000-0d93-319d-8220-4a1fb0372b51"
+    ipam:
+      config:
+        - subnet: 192.168.0.0/24
+          gateway: 192.168.0.1
