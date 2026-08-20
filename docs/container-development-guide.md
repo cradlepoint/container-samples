@@ -93,6 +93,35 @@ source with it enabled, that is a real decision with a size cost. Measure both
 architectures and report the numbers rather than switching bases silently or
 quietly dropping the feature.
 
+**The same principle applies to pip packages and arm/v7 specifically.** A pinned
+version installing cleanly for `linux/arm64` does not mean it has any wheel for
+`linux/arm/v7` — this is common, not an edge case, for the numpy-adjacent
+ecosystem (numpy, opencv-python-headless, PyAV, TFLite runtimes), because
+publishing armv7 binary wheels for compiled extensions is rare upstream even
+when arm64 wheels are routine. Check the *specific pinned version*, not just
+whether the package "supports ARM" in general — wheel availability varies by
+release, and a later version sometimes adds armv7 support an earlier pin lacks.
+
+Confirm this from PyPI's package index directly rather than from
+`pip download`/`pip install` failures, which return the identical
+"no matching distribution" message whether the wheel genuinely does not exist
+or the platform/Python-version tag in the command was simply wrong — a
+negative result from pip alone does not distinguish the two:
+
+```bash
+curl -s https://pypi.org/simple/<package-name>/ | grep -o '<package_name>-<version>[a-zA-Z0-9_.-]*\.whl'
+```
+
+Read the tags directly: `manylinux_*_aarch64` / `macosx_*_arm64` cover arm64;
+`armv7l` in the tag (e.g. `manylinux_2_31_armv7l`) is what would cover arm/v7,
+and its absence across every listed wheel for that version is the actual
+evidence of no support — not a single failed `pip download` attempt. If a
+Dockerfile comment already states an architecture limitation for a pinned
+dependency, verify it this way before relying on it, especially before
+encoding it into automation (a CI build matrix, a per-architecture override)
+that will silently keep excluding that architecture on the comment's word
+alone.
+
 ### Keep Images Minimal
 
 - Use `--no-cache` with `apk add` to avoid caching package indexes

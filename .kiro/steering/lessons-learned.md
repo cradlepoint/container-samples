@@ -2445,3 +2445,63 @@ below is about how that assumption survived long enough to be written into code.
   working example carries that example's peer assumptions**; where a setting must
   match the other side, say so in the comment next to the default, because the
   failure it causes does not look like a proposal mismatch.
+
+## 2026-08-20 — Automating the build/publish pipeline, and re-verifying an inherited claim
+
+The task was CI automation (build every sample, publish to GHCR), not a new
+container. Two lessons came out of it: one about a platform behavior I stated
+without an authoritative citation, and one about re-checking an inherited
+Dockerfile comment before encoding it into automation that would keep acting on
+it indefinitely.
+
+### A package registry's visibility setting is sticky, but say what evidence backs that
+
+- Asked whether a GHCR package flipped to Public stays Public after a later push,
+  I answered "yes" from platform-behavior knowledge rather than from an executed
+  test against a real package in this repo (there is no live GHCR package here to
+  push against). That is the correct answer, but this file has repeatedly flagged
+  the difference between "confirmed by execution" and "stated from platform
+  knowledge" as a distinction worth preserving explicitly rather than blurring —
+  and this answer was the second kind, not the first. Said so in the response
+  rather than presenting it with the same confidence as a probe result.
+- General reminder for platform-behavior questions that arise from automation work
+  (registry visibility, CI permissions, token scoping) rather than from a
+  container running on the router: the "transfers / does not transfer" bucketing
+  this file uses for kernel and engine claims is really a special case of a wider
+  rule — state the evidence class (documentation, direct test, inference) for
+  *any* platform claim, not only the router-specific ones this file has focused
+  on so far.
+
+### Re-verify an inherited Dockerfile comment before building automation around it
+
+- `edge_ai`'s Dockerfile carries a comment asserting its pinned dependencies are
+  arm64-only, and the existing build-and-publish workflow already encoded that as
+  a hardcoded per-sample exception. Rather than trust the comment when asked to
+  make the workflow build both architectures, checked it directly against PyPI's
+  package index for the exact pinned versions (`numpy==1.26.4`,
+  `av==13.1.0`, `ai-edge-litert==2.1.5`, `opencv-python-headless==4.10.0.84`) and
+  confirmed none publish an `armv7l`-tagged wheel at those versions. The comment
+  was correct, but correctness was established by checking, not by inheriting it.
+- **A `pip download`/`pip install` failure for a cross-platform target does not
+  distinguish "no wheel exists" from "the platform/Python-version tag in my
+  command is wrong."** Both produce the identical `ERROR: No matching
+  distribution found` message. Several attempts with slightly different
+  `--python-version`/`--abi` combinations all failed this way before switching to
+  reading `https://pypi.org/simple/<pkg>/` directly and grepping the actual wheel
+  filenames — which is unambiguous, since the absence of any `armv7l`-tagged
+  entry across every listed wheel for that version *is* the evidence, rather than
+  one failed command whose failure mode is inherently ambiguous. Recorded in
+  `docs/container-development-guide.md` as the preferred verification method for
+  this specific claim shape (a pinned Python package's per-architecture wheel
+  availability), since it will recur for any future arm/v7 build decision
+  involving compiled Python extensions.
+- This is the same family as "verify the check before suspecting the code" and
+  "package presence is not feature presence," aimed at a slightly different
+  target: not the daemon's own behavior and not the check's correctness, but
+  whether an *inherited claim already encoded into working automation* still
+  holds before extending that automation's scope. The claim in this case turned
+  out to be right, but the check was cheap (a few `curl`+`grep` commands) relative
+  to what silently building a broken arm/v7 image for a CV/AI container would have
+  cost to discover later — and relative to what silently *dropping* a real
+  architecture constraint because "the user asked for both" would have cost if the
+  claim had turned out to be wrong instead.

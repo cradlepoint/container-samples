@@ -1,0 +1,143 @@
+name: Build and Publish Containers
+
+# Builds every sample under containers/ and publishes images to the GitHub
+# Container Registry (ghcr.io).
+#
+# Tagging convention matches what every sample README already documents:
+# a plain `:latest` tag for the arm64 build, `:latest-armv7` for the arm/v7
+# build -- not a combined multi-arch manifest. Whether cpdockerengine (the
+# on-router container engine) resolves multi-arch manifest lists correctly
+# is unverified, so this workflow doesn't introduce that as a new pattern.
+#
+# One-time manual step after this workflow first runs on the default branch:
+# each new ghcr.io package is created PRIVATE by default, regardless of the
+# repo's own visibility. To make a package pullable anonymously (required
+# for "public use" on a router, which has no registry credentials), go to
+# the package's GitHub page -> Package settings -> Change visibility ->
+# Public. This has to be done once per container image; it is not something
+# the GITHUB_TOKEN used here is allowed to do on its own.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'containers/**'
+      - '.github/workflows/build-containers.yml'
+  pull_request:
+    paths:
+      - 'containers/**'
+      - '.github/workflows/build-containers.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    name: Discover containers
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build build/platform matrix
+        id: set-matrix
+        run: |
+          set -euo pipefail
+          matrix='[]'
+          for dockerfile in containers/*/Dockerfile; do
+            dir=$(dirname "$dockerfile")
+            name=$(basename "$dir")
+
+            # Per-container platform overrides. Default is arm64 + arm/v7,
+            # matching every existing README's "Building" section. Add an
+            # entry here only when a sample's own Dockerfile cannot build
+            # for one of the two -- e.g. edge_ai's base image and pinned
+            # wheels (opencv, tflite) are arm64-only, per its own header
+            # comment ("Target: Cradlepoint routers (linux/arm64)").
+            case "$name" in
+              edge_ai)
+                platforms="linux/arm64"
+                ;;
+              *)
+                platforms="linux/arm64 linux/arm/v7"
+                ;;
+            esac
+
+            for platform in $platforms; do
+              case "$platform" in
+                linux/arm64)  suffix="" ;;
+                linux/arm/v7) suffix="-armv7" ;;
+                *) suffix="-$(echo "$platform" | tr '/' '-')" ;;
+              esac
+              matrix=$(jq -c --arg name "$name" --arg platform "$platform" --arg suffix "$suffix" \
+                '. + [{"name": $name, "platform": $platform, "tag_suffix": $suffix}]' <<<"$matrix")
+            done
+          done
+          echo "Discovered matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }} (${{ matrix.platform }})
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.discover.outputs.matrix) }}
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: build-${{ matrix.name }}-${{ matrix.platform }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image reference
+        id: image
+        run: |
+          set -euo pipefail
+          owner_repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/${owner_repo}/${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(echo "${{ github.sha }}" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      # Build on every push and PR (validates the Dockerfile for both
+      # architectures); only push to the registry on master, never on a PR.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: containers/${{ matrix.name }}
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ steps.image.outputs.name }}:latest${{ matrix.tag_suffix }}
+            ${{ steps.image.outputs.name }}:sha-${{ steps.image.outputs.short_sha }}${{ matrix.tag_suffix }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=NCOS container sample: ${{ matrix.name }}
+          # Keep the pushed image a plain single-platform manifest rather
+          # than an attestation-augmented image index. Whether
+          # cpdockerengine resolves provenance/SBOM attestation manifests
+          # is unverified, so don't introduce them into images meant to be
+          # pulled by a router.
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=${{ matrix.name }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}-${{ matrix.platform }}

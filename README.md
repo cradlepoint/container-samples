@@ -48,6 +48,17 @@ If you've built something worth sharing, use Kiro's Source Control view to commi
 
 Then open a PR from your fork's branch to `cradlepoint/container-samples` on GitHub. Include what the container does, which router models/architectures you tested, and any measured image sizes in the PR description.
 
+## Pre-Built Images
+
+Every sample under `containers/*/` is automatically built and published to the GitHub Container Registry on each change to `master`. Pull the image directly instead of building it yourself:
+
+```
+ghcr.io/cradlepoint/container-samples/<sample_name>:latest        # linux/arm64
+ghcr.io/cradlepoint/container-samples/<sample_name>:latest-armv7  # linux/arm/v7
+```
+
+Use the tag matching your router's architecture (see each sample's README for supported models). No login is required to pull.
+
 ## Platform Overview
 
 Ericsson routers run containers on a Linux ARM64 (aarch64) platform using musl libc. Containers must be built for this target architecture and C library to function correctly.
