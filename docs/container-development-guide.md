@@ -19,7 +19,7 @@ This list is incomplete and grows as capabilities are confirmed. Treat anything 
 | Capability | Native? | Notes |
 |------------|---------|-------|
 | MQTT broker (mosquitto) | Yes | Runs natively. Do not ship a broker container. A client that publishes into the native broker is still a valid pattern. |
-| SNMP agent | Yes | Native agent exists. The `SNMP_agent/` sample is justified only because it fixes unstable ifIndex assignment, not because SNMP is missing. |
+| SNMP agent | Yes | Native agent exists. The `snmp_agent/` sample is justified only because it fixes unstable ifIndex assignment, not because SNMP is missing. |
 | Remote syslog (outbound) | Yes | Sends the router's own logs to a remote collector. |
 | NMEA / TAIP GPS forwarding | Yes | Streams sentences to a remote server or local port. |
 | RTSP viewing / transcoding | No | No native way to view or re-encode a camera's RTSP stream in a browser. The `rtsp_viewer/` sample fills this gap. |
@@ -30,7 +30,7 @@ A container earns its place when it does one of these:
 
 - Provides a service NCOS genuinely lacks
 - Translates between a native capability and a protocol the native feature does not speak
-- Fixes a specific defect or limitation in the native implementation, as `SNMP_agent/` does
+- Fixes a specific defect or limitation in the native implementation, as `snmp_agent/` does
 - Adds behavior the native feature has no concept of, such as buffering data through a WAN outage and replaying it
 
 "NCOS already does X" does not always kill an idea — but it does mean the container must be reframed around the delta, and the README should state plainly what the native feature cannot do.
@@ -266,6 +266,38 @@ Watch for the inverse too: with `core.ignorecase=true` (the default on macOS),
 git does **not** notice a case-only rename done on disk, so the working tree and
 the index can disagree indefinitely with nothing looking wrong locally. A
 case-only rename has to go through `git mv` via a temporary name to be recorded.
+
+**This is not only a build-time "file not found" risk — it breaks CI in ways
+that have nothing to do with reading a file.** Observed directly: a sample
+*directory* had drifted this way (`SNMP_agent` in git's index,
+`snmp_agent` on a macOS working tree, with byte-identical file contents on both
+sides — confirmed with checksums before fixing). Nothing failed locally, because
+every local tool read the macOS-reported lowercase name. On a Linux CI runner,
+which checks out git's index exactly, buildx received the uppercase directory
+name from a `for dir in containers/*/` glob and used it to construct an image
+tag, which failed with `invalid tag "ghcr.io/.../SNMP_agent:latest": repository
+name must be lowercase` — an OCI/Docker naming rule, not a missing-file error.
+Any automation that discovers sample names by listing a directory (a CI build
+matrix, a doc generator, a release script) inherits whatever case the
+filesystem reports, and on a case-insensitive host that is not guaranteed to
+match what git's index — and therefore a Linux checkout — actually has. Sweep
+the **whole tree**, not a single suspected path, when checking for this:
+
+```bash
+# Every git-tracked top-level sample directory, by git's authoritative casing
+git ls-files containers/ | sed -E 's#^(containers/[^/]+)/.*#\1#' | sort -u
+
+# Compare against what the local filesystem reports
+find containers -maxdepth 1 -type d | sort
+```
+
+A mismatch between the two outputs is the drift, independent of whether any
+single file inside it also mismatches. Fix the git side with `git mv` through a
+temporary name; separately, any script that turns a directory listing into a
+name used downstream (an image tag, a service name, a generated path) should
+lowercase defensively rather than assuming the filesystem's case is already
+correct — the case-insensitive host is not the machine that will run the
+script for real.
 
 ### Python Applications
 

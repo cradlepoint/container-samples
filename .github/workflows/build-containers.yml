@@ -114,8 +114,19 @@ jobs:
         id: image
         run: |
           set -euo pipefail
+          # OCI/Docker repository names must be all-lowercase. Lowercase both
+          # halves defensively rather than relying on the sample directory
+          # name already being lowercase: git is case-exact and a working
+          # tree on a case-insensitive filesystem (macOS/Windows) can drift
+          # from what git's index actually records without anyone noticing,
+          # which previously produced a directory name here with uppercase
+          # letters and a hard buildx failure ("repository name must be
+          # lowercase"). Fix the drift at the source (git mv through a
+          # temporary name) when found, but don't depend on every
+          # contributor's checkout being case-consistent.
           owner_repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          echo "name=ghcr.io/${owner_repo}/${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+          sample_name=$(echo "${{ matrix.name }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/${owner_repo}/${sample_name}" >> "$GITHUB_OUTPUT"
           echo "short_sha=$(echo "${{ github.sha }}" | cut -c1-12)" >> "$GITHUB_OUTPUT"
 
       # Build on every push and PR (validates the Dockerfile for both

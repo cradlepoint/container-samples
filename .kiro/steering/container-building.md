@@ -127,7 +127,7 @@ Most of this runs on the development machine. Do it before claiming the containe
 6. Never run entrypoints or config-generation scripts on the host — they write absolute paths like `/etc/<daemon>/`. Run them inside the built image with `--entrypoint sh` so the writes are contained.
 7. Config Store logic can be tested without a router by binding a mock `AF_UNIX` socket and overriding `cp.SOCKET_PATH`. See "Verifying Before Deployment" in `docs/container-development-guide.md`, and `tests/test_cp.py` for a worked example (`python3 -m unittest discover -s tests`). That harness is worth the hundred lines it costs: written to review `cp.py` on 2026-08-17, it found six behavioural bugs in the shared client itself. `cp.py` is covered by it now; a sample's own logic is not.
 8. **Induce the failures your health and status code exists to detect, and watch it report them.** Confirming a probe says "healthy" while things are healthy tests almost nothing — a probe can be wrong only in the red direction. For anything touching `cs.sock`, exercise three distinct states, since only the first happens for free locally: socket absent, socket present but never answering (a hung Config Store, which is what a wedged container engine looks like), and socket answering with a truncated or non-JSON body. Any cached "unavailable" state needs an explicit path back to available, or one transient startup failure becomes a permanent one in a container that still looks alive.
-9. **Check paths case-exactly, against `git ls-files` rather than the filesystem.** The image is Linux and case-sensitive; macOS is not, so a `COPY`, `PYTHONPATH`, `import` or documented path whose case is wrong builds fine locally and fails on a Linux builder. `os.path.exists()` and `ls` will happily confirm a path a fresh clone does not have. This applies to the dangling-reference sweep as well — that checker gives false negatives on macOS unless it consults git. Keep the extractor strict when sweeping docs (markdown links, plus backticked tokens that end in a real file extension or start with a known top-level directory): a looser one flags every path-shaped token that is not a path — API prefixes like `status/`, URL schemes, generic filenames, sample nicknames — and a noisy report gets ignored, which is worse than no report.
+9. **Check paths case-exactly, against `git ls-files` rather than the filesystem.** The image is Linux and case-sensitive; macOS is not, so a `COPY`, `PYTHONPATH`, `import` or documented path whose case is wrong builds fine locally and fails on a Linux builder. `os.path.exists()` and `ls` will happily confirm a path a fresh clone does not have. This applies to the dangling-reference sweep as well — that checker gives false negatives on macOS unless it consults git. Keep the extractor strict when sweeping docs (markdown links, plus backticked tokens that end in a real file extension or start with a known top-level directory): a looser one flags every path-shaped token that is not a path — API prefixes like `status/`, URL schemes, generic filenames, sample nicknames — and a noisy report gets ignored, which is worse than no report. Do this check at the **directory** level too, not only per-file: compare `git ls-files containers/ | sed -E 's#^(containers/[^/]+)/.*#\1#' | sort -u` against `find containers -maxdepth 1 -type d`, since a whole sample directory can drift this way and the symptom then shows up in CI as an OCI naming error (repository names must be lowercase) rather than a file-not-found, which is easy to misdiagnose as a workflow bug instead of a case mismatch. Any script that derives a name from a directory listing (a CI matrix, an image tag, a generated service name) should lowercase it defensively rather than trust the filesystem's reported case.
 10. **Verify scripted multi-site edits by match count, not by exit status.** A bulk `str.replace()` across a file needs an asserted occurrence count or a bounded target section, then a read of each changed site. A short pattern intended for one place routinely matches three, and the script reports success either way.
 11. Clean up test artifacts, temporary scripts, local images and `__pycache__` before finishing.
 12. Report what was verified in the chat response, not in the sample's README. A README describes the container to someone deploying it; build-time verification notes (image sizes, what was run locally vs. not verifiable without a router, docker stop timing) are a different audience and go stale the moment the container changes. Keep the README to what it does, its files, configuration, building, and deployment.
@@ -164,14 +164,14 @@ Local verification cannot cover Config Store behaviour, image pulls, or anything
 
 ## Phase 4: Review the Reference Examples
 
-### SNMP_agent/ — Simple daemon pattern
+### snmp_agent/ — Simple daemon pattern
 
-The `SNMP_agent/` directory is a reference for simple long-running daemons:
-- `containers/SNMP_agent/Dockerfile` — Alpine base, minimal packages, entrypoint pattern
-- `containers/SNMP_agent/entrypoint.sh` — Config generation then exec into main process
-- `containers/SNMP_agent/gen_conf.py` — Reading router config via cp.py to generate app config
-- `containers/SNMP_agent/ncos_snmp.py` — Long-running daemon using cp.py for data
-- `containers/SNMP_agent/cp.py` — The SDK module (copy into new containers)
+The `snmp_agent/` directory is a reference for simple long-running daemons:
+- `containers/snmp_agent/Dockerfile` — Alpine base, minimal packages, entrypoint pattern
+- `containers/snmp_agent/entrypoint.sh` — Config generation then exec into main process
+- `containers/snmp_agent/gen_conf.py` — Reading router config via cp.py to generate app config
+- `containers/snmp_agent/ncos_snmp.py` — Long-running daemon using cp.py for data
+- `containers/snmp_agent/cp.py` — The SDK module (copy into new containers)
 
 ### edge_ai/ — Computer Vision / AI pattern
 

@@ -181,6 +181,20 @@ mv main_copy.py main.py
   correcting the name, making the repository public, or adding credentials for
   it under [config/container/registry](ncos-api/config/container.md).
 
+  **The same ambiguity exists on `ghcr.io` (GitHub Container Registry).**
+  GHCR packages are created **private** by default regardless of the linked
+  repository's own visibility, and there is no automated way to flip that —
+  it requires a manual "Change visibility" action on the package's GitHub
+  page, once per package. An anonymous pull against a private or nonexistent
+  GHCR package fails identically: `curl` against
+  `https://ghcr.io/v2/<owner>/<image>/tags/list` returns `401`, and the token
+  endpoint (`https://ghcr.io/token?service=ghcr.io&scope=repository:<owner>/<image>:pull`)
+  returns `{"errors":[{"code":"DENIED",...}]}` whether the package is private
+  or was never published at all. Neither response distinguishes the two
+  causes, so — same as Docker Hub — check the name match first, then confirm
+  the package's visibility setting on GitHub directly rather than inferring it
+  from the pull error.
+
 - **Project appears in `container list` with no containers under it?** This one
   symptom has three different causes, and they are distinguishable. Note first
   that `container list` itself reads project *config*, so it answers normally

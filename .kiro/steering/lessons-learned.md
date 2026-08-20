@@ -2505,3 +2505,137 @@ it indefinitely.
   cost to discover later — and relative to what silently *dropping* a real
   architecture constraint because "the user asked for both" would have cost if the
   claim had turned out to be wrong instead.
+
+## 2026-08-20 (second entry) — Simplifying a claim removed its precondition, not just its explanation
+
+Task was request-only: simplify a README section describing the new automated
+build/publish pipeline down to "images are built and ready to use." No container
+was built.
+
+### A "ready to use" claim inherited an unmet precondition when the explanatory caveats were removed
+
+- The fuller version of this section, written earlier the same session, had its
+  own paragraph stating that a new GHCR package is private by default and needs
+  a one-time manual visibility flip before an anonymous pull works. Asked to
+  simplify to "images are automatically built and published... ready to use,"
+  the CI-mechanics explanation was dropped along with that paragraph, and the
+  replacement text asserted "No login is required to pull" as a flat,
+  present-tense fact.
+- That claim was not true at the moment it was written, independent of whether
+  the manual flip has happened: the workflow file itself was still an
+  uncommitted local change when the README was edited to describe its output as
+  ready to use. Nothing had reached `master`, so no run had ever fired, so no
+  image had ever been pushed. Checked directly rather than assumed —
+  `curl -s -o /dev/null -w '%{http_code}' https://ghcr.io/v2/.../tags/list`
+  returned `401`, and GHCR's anonymous-token endpoint returned `DENIED`, both
+  consistent with "nothing published" and indistinguishable from "published but
+  still private" — the same ambiguous-error shape this repo's own Docker Hub
+  troubleshooting entry in `docs/containers-quick-start.md` already documents
+  for a different registry, recurring here on GHCR.
+- **A user's simplification request can carry an implicit premise that is not
+  yet true, and complying with the literal wording propagates that gap into a
+  document other people will read as settled.** The caveat-heavy version written
+  earlier the same session correctly distinguished "this is configured to
+  happen" from "this has happened and been verified." Simplifying collapsed that
+  distinction: a "ready to use" claim about infrastructure needs to actually be
+  true, or explicitly conditional, not just more cleanly worded. This is the
+  same family as "unverified claims presented as fact" already in this file,
+  arriving through compliance with a user's own request rather than through my
+  own reasoning — which makes it easier to miss, because the instruction to
+  simplify reads as permission to drop *all* the removed text's information,
+  when only the mechanics explanation was safe to drop and the precondition for
+  the claim being true was not.
+- Did not revert the simplification — the user asked for it and may already
+  intend to merge the workflow and perform the manual flip shortly. The gap was
+  not flagged in the response at the time, which is the actual miss: the
+  standing "state what was verified and what could not be" rule already in this
+  file applies here too, and a one-sentence caveat in the response ("this will
+  be literally true once merged and the first package is flipped public") costs
+  nothing and would have closed it.
+
+### General rule
+
+- **Before writing or simplifying a README claim about automated infrastructure
+  ("built and published automatically," "ready to use," "no login required"),
+  check whether the described automation has actually run and produced the
+  claimed artifact — not just whether the workflow file describing it exists in
+  the working tree.** A workflow file existing is a plan; a successful, merged,
+  executed run is a fact. The two are easy to conflate specifically when writing
+  documentation *about* a pipeline in the same sitting the pipeline itself is
+  authored, because the doc naturally describes the pipeline's intended, not yet
+  observed, behavior.
+- When a "ready to use" claim rests on a manual step outside the code (a
+  registry visibility flip, an org setting, credential provisioning),
+  simplifying the surrounding prose should not silently make the claim
+  unconditional. Either keep a one-line conditional ("once published," "after
+  the first run") in the file, or — if the user explicitly wants unconditional
+  wording — flag once in the response that it will not be true until the manual
+  step happens. The caveat belongs in the response when it is about *timing*
+  relative to work not yet done; the file itself is fine describing the steady
+  state once that work is actually done.
+
+## 2026-08-20 (third entry) — A directory-level case mismatch surfaced as a CI naming error, not a missing file
+
+The CI workflow added earlier this session failed on its first real run, for a
+sample that was not touched in this session. The failure looked like a workflow
+bug at first glance; it was a pre-existing case mismatch between git's index and
+the macOS working tree, the same failure class this file already documents at
+the single-file level, arriving here at the directory level with a different
+symptom.
+
+### The existing case-mismatch lesson was scoped too narrowly
+
+- This file and `docs/container-development-guide.md` already warned that a
+  single file's case can drift between a macOS working tree and git's
+  case-exact index (`core.ignorecase=true` lets a case-only rename happen on
+  disk without git recording it), and that the fix is `os.path.exists()` →
+  `git ls-files` for verification. That lesson was written with a single
+  suspected file in mind ("does the repo really contain this exact path"),
+  not with a directory-discovery script in mind.
+- Here the drift was at the **directory** level — `containers/SNMP_agent` in
+  git's index, `containers/snmp_agent` as reported by every local tool on this
+  Mac (`ls`, `find`, `os.path.exists`, all in agreement, all wrong relative to
+  what a Linux checkout has). Confirmed with checksums that all six tracked
+  files were byte-identical on both sides — nothing had actually changed except
+  the case, consistent with an old, unrecorded rename rather than a real edit.
+- **The failure mode was not "file not found."** The CI workflow's matrix-build
+  step lists sample directories with a shell glob (`containers/*/`), which on
+  the Linux runner enumerated git's checked-out (correct-case) name,
+  `SNMP_agent`, and used it verbatim to build a Docker image tag. Docker/OCI
+  repository names must be all-lowercase, so buildx failed with
+  `invalid tag "...SNMP_agent:latest": repository name must be lowercase` —
+  an image-naming error, at a completely different layer than a missing file.
+  Reading only the existing lesson's framing ("builds fine locally, fails on a
+  Linux builder with file not found") would not have pointed at case at all;
+  the actual error text named a Docker/OCI rule, not a filesystem one.
+
+### General rule
+
+- **Any script that derives a name from a directory listing — a CI build
+  matrix, an image tag, a generated service name, a doc index — inherits
+  whatever case the filesystem reports it as, and that is only trustworthy if
+  the filesystem is case-sensitive.** On a case-insensitive development host
+  this is not guaranteed to match git's index, which is what a Linux CI runner
+  actually checks out. This generalizes the existing single-file lesson: the
+  unit at risk is not just "a path referenced in a `COPY` or an `import`," it
+  is any name a script constructs from `ls`/`find`/a glob and then uses
+  downstream for something with its own naming rules (a registry, a DNS label,
+  a package name) — the case bug and the consuming rule's error message can be
+  arbitrarily far apart, which is what made this one non-obvious.
+- **Sweep the whole tree for this, not one suspected path, once you know to
+  look.** `git ls-files containers/ | sed -E 's#^(containers/[^/]+)/.*#\1#' |
+  sort -u` against `find containers -maxdepth 1 -type d` finds every
+  directory-level mismatch in one comparison, cheaper than re-deriving the
+  check per-sample after each new CI failure.
+- **Harden the consuming script defensively in addition to fixing the git
+  side.** Both fixes matter and neither substitutes for the other: `git mv`
+  through a temporary name corrects the actual drift (and should be done,
+  since other contributors' checkouts and any other automation reading the
+  same directory listing are exposed to the same bug until it is), but a CI
+  workflow that lowercases names before using them in a registry tag is not
+  vulnerable to the next occurrence of the same class of drift, from this or
+  any other sample, whenever it next happens.
+- Recorded in `docs/container-development-guide.md`'s existing case-sensitivity
+  section (extended rather than duplicated, since the underlying mechanism —
+  `core.ignorecase=true` letting a rename go unrecorded — is identical to what
+  was already there) and in Phase 2b of the workflow.

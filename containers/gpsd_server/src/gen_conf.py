@@ -3,7 +3,7 @@
 The entrypoint needs the gpsd and NMEA ports to build the gpsd command line,
 but the authoritative values live in appdata. Rather than parsing JSON in ash,
 this runs first and writes a small env file for the shell to source -- the same
-pattern the SNMP_agent sample uses for its port.
+pattern the snmp_agent sample uses for its port.
 
 Appdata defaults are also provisioned here so the fields exist in NCM even if
 the main process fails to start.
