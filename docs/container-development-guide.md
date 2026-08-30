@@ -141,6 +141,30 @@ ENTRYPOINT ["/entrypoint.sh"]
 
 End the script with `exec` so the application replaces the shell as PID 1 and receives `SIGTERM` directly. Without `exec`, the shell holds PID 1, signals are not forwarded, and container stop falls back to `SIGKILL` after the timeout.
 
+#### Generating Config From Environment Variables, Unless a File Is Present
+
+A useful pattern for a container that must run both on NCOS and locally: the
+entrypoint generates the daemon's config from environment variables, but leaves
+an existing config file alone if one is already there. NCOS cannot bind-mount
+host files while local development can, so one image covers both.
+
+The consequence is easy to miss and belongs in the README: **on the config-file
+path, every environment variable the container documents has no effect at all.**
+The daemon reads the file; nothing consults the variables. For ordinary settings
+that is a confusing inert knob. For credentials it is a security problem — a
+password that is set, plainly visible in the compose file, and completely ignored
+looks exactly like protection. This is the mirror of the rule that an absent
+configuration must never masquerade as a runtime failure: here a *present*
+configuration masquerades as an effective one.
+
+Two things make it safe:
+
+- State in the README which configuration path each variable applies to, rather
+  than documenting variables as though they always take effect.
+- Have the entrypoint log a warning naming any generation-only variable it finds
+  set while it is using a provided config file. Failing visibly beats documenting
+  the trap, and the warning is what a deployment actually sees.
+
 ### Running More Than One Process
 
 Prefer one process per container. When an apk daemon and a Python helper genuinely must share a container (for example, the helper talks to the daemon over `127.0.0.1`), note that Alpine's `ash` has no `wait -n`, so the usual "wait for whichever child exits first" idiom is unavailable. Use a POSIX polling supervisor and let the restart policy handle recovery:
@@ -891,6 +915,49 @@ the table then holds only specific destinations. So this failure mode appears th
 moment a requirement widens from "these destinations" to "everything" — worth
 re-testing the reverse direction whenever a selector, redirect, NAT rule or
 firewall default is broadened.
+
+### Verify a Wrapped Binary's Behaviour From Its Source at the Pinned Tag
+
+Where a container wraps an off-the-shelf binary, any documented claim about that
+binary's behaviour — especially a security-relevant one such as an auth default
+or a bypass — should be settled against **the source at the version the
+Dockerfile pins**, not against upstream's current documentation website. Upstream
+docs describe the newest release; the container runs the pin. Errors run in both
+directions: docs describing an option the pinned version does not have, and the
+pinned version having an option the docs you read never mentioned.
+
+```bash
+# Authoritative for that exact version, and costs seconds.
+curl -fsSL https://raw.githubusercontent.com/<org>/<repo>/<pinned-tag>/internal/<mod>/<mod>.go
+
+# Separately: is the pin itself behind upstream? Two different questions.
+curl -fsSL https://api.github.com/repos/<org>/<repo>/releases/latest | grep -m1 tag_name
+```
+
+A daemon's **config struct tags enumerate everything its config accepts**, which
+prose documentation does not, so reading them answers "is there a knob for this"
+definitively; reading the middleware or handler that consumes them answers what
+the knob does. Do not reach for `strings` on the release binary instead — many
+projects ship UPX-packed binaries, where it returns nothing useful.
+
+**Enumerate per listener, module and endpoint rather than treating the daemon as
+one thing.** A daemon with several listeners frequently has different auth
+semantics on each — one with a hardening option, another with no equivalent — and
+a single sentence covering "the daemon" will be wrong about at least one of them.
+The per-module config structs make this mechanical to check.
+
+Two habits for writing the result up:
+
+- **Record the version the claim was verified against**, exactly as a router probe
+  result is recorded with device model and firmware. A behavioural claim about a
+  pinned dependency is true only for some version range, and without the version
+  a later pin bump silently invalidates the documentation.
+- **Where a security note quantifies over a set** — all ports, all endpoints, all
+  paths — enumerate the members and confirm the mitigation covers each. Prose
+  invites the reader to assume uniform coverage; a per-member table makes a gap
+  structurally visible rather than hiding it inside a quantifier. Watch for
+  "always", "never" and "none of" in a write-up of a specific observation: those
+  are the point where a claim about one endpoint became a claim about the daemon.
 
 ### Verify a Modular Daemon's Loaded Modules, Not Its Files
 

@@ -16,6 +16,16 @@ name: Build and Publish Containers
 # the package's GitHub page -> Package settings -> Change visibility ->
 # Public. This has to be done once per container image; it is not something
 # the GITHUB_TOKEN used here is allowed to do on its own.
+#
+# This step needs ADMIN permission on the package specifically, not just
+# Write access to the repo. A package inherits its access permissions from
+# the linked repo by default, and changing a package's visibility requires
+# admin on that package -- observed directly: a contributor with Write access
+# to this repo (enough to merge the PR that adds this workflow) got "You
+# don't have access to repository options" on the repo's own Settings page,
+# which is the same permission boundary that blocks the package visibility
+# control. Confirm who has org-owner or repo-admin rights before assuming
+# whoever merges this can also complete the visibility flip themselves.
 
 on:
   push:

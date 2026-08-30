@@ -57,7 +57,7 @@ ghcr.io/cradlepoint/container-samples/<sample_name>:latest        # linux/arm64
 ghcr.io/cradlepoint/container-samples/<sample_name>:latest-armv7  # linux/arm/v7
 ```
 
-Use the tag matching your router's architecture (see each sample's README for supported models). No login is required to pull.
+Use the tag matching your router's architecture (see each sample's README for supported models). No login is required to pull, once a maintainer with repo-admin rights has completed the one-time per-package visibility step described in [`.github/workflows/build-containers.yml`](.github/workflows/build-containers.yml).
 
 ## Platform Overview
 

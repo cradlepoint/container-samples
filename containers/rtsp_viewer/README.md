@@ -41,9 +41,23 @@ configuration paths and picks between them at startup:
    `/config/go2rtc.yaml` already has content when the container starts,
    `entrypoint.sh` leaves it alone and starts go2rtc directly.
 2. **Environment variables** (`docker-compose.cradlepoint.yml`, NCOS). If no
-   config file is present, `entrypoint.sh` generates one from `CAMERA<n>_URL` /
-   `CAMERA<n>_NAME` pairs (n = 1..20), plus `WEBRTC_CANDIDATE` and the auth
-   variables below.
+   config file is present, `entrypoint.sh` generates one from the variables
+   below.
+
+| Variable | Purpose |
+|----------|---------|
+| `CAMERA<n>_URL` | RTSP source URL for camera n (n = 1..20) |
+| `CAMERA<n>_NAME` | Stream name for camera n, used in the UI and in stream URLs. Defaults to `camera<n>` |
+| `RTSP_URL` | Single-camera fallback, used only when no `CAMERA<n>_URL` is set at all |
+| `CAMERA_NAME` | Stream name for the `RTSP_URL` fallback. Defaults to `camera1` |
+| `WEBRTC_CANDIDATE` | Address browsers should use to reach WebRTC media — see below |
+| `API_USERNAME`, `API_PASSWORD` | Basic auth for the web UI/API on 1984 — see Security |
+| `RTSP_USERNAME`, `RTSP_PASSWORD` | Basic auth for the RTSP relay on 8554 — see Security |
+
+Watch the naming collision between `RTSP_URL` and `RTSP_USERNAME` /
+`RTSP_PASSWORD`: the first is a camera *source* this container pulls from, the
+other two are credentials the container's own RTSP relay *demands* from
+clients. They are unrelated settings.
 
 Either way, camera credentials end up in the RTSP URL itself
 (`rtsp://user:pass@host/path`), which is how most RTSP cameras authenticate.
@@ -60,20 +74,33 @@ router's LAN IP and the mapped WebRTC port (`<router-ip>:8555` by default).
 
 ## Security
 
-**None of the published ports are authenticated unless you set the auth
-variables below.** Mapped ports on NCOS are reachable on WAN as well as LAN,
-with no firewall filtering in front of them, and this service streams live
-video from a physical camera.
+**The auth variables cover the web UI (1984) and the RTSP relay (8554). Nothing
+authenticates the WebRTC ports (8555).** Mapped ports on NCOS are reachable on
+WAN as well as LAN, with no firewall filtering in front of them, and this
+service streams live video from a physical camera.
 
-- Set `API_USERNAME` / `API_PASSWORD` and `RTSP_USERNAME` / `RTSP_PASSWORD` to
-  enable Basic auth on the web UI/API and the RTSP relay respectively. Both
-  pairs must be set together or the corresponding service stays open.
-- **go2rtc always skips auth for calls it treats as coming from localhost**,
-  even when a username/password is configured. This is go2rtc's own
-  documented behavior, not a bug in this container, but it means auth alone
-  does not make the port safe against anything already on the same network
-  segment as the router's loopback (nothing normally is, but be aware Basic
-  auth here is not a complete access-control story).
+What each published port can be authenticated with, in the go2rtc version the
+Dockerfile pins (`v1.9.14`):
+
+| Port | Auth | Skipped for loopback callers? |
+|------|------|-------------------------------|
+| 1984 — web UI / HTTP API | `API_USERNAME` + `API_PASSWORD` (Basic) | Yes, unless go2rtc's `api.local_auth` is set — which this container has no environment variable for, so it needs a mounted config file |
+| 8554 — RTSP relay | `RTSP_USERNAME` + `RTSP_PASSWORD` (Basic) | Yes, always. go2rtc has no `local_auth` equivalent for this listener |
+| 8555/tcp + 8555/udp — WebRTC | none available | n/a — go2rtc's `webrtc:` config takes no username or password at all |
+
+- Each pair must be set together. Setting only a username or only a password
+  leaves that service open, and nothing warns you.
+- Authenticating 1984 does gate who can *start* a WebRTC stream, because
+  signaling goes through the API. The 8555 ports themselves stay
+  unauthenticated regardless.
+- **The loopback bypass** means Basic auth here is not a complete
+  access-control story: anything sharing the container's network namespace
+  reaches these services without credentials. Nothing normally does.
+- **The auth variables only apply when this container generates the config.**
+  If `/config/go2rtc.yaml` already exists — the bind-mount path
+  `docker-compose.yml` uses — go2rtc reads that file and every variable in the
+  table above is silently inert. Put `username` / `password` in the file
+  instead. That is also the only way to set `local_auth` for the API.
 - For anything beyond a trusted network, the more robust option is to skip
   `ports:` entirely and attach the service to a Local IP Network instead, so
   it's reachable only from that LAN:
