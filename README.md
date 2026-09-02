@@ -336,9 +336,12 @@ services:
   my-service:
     image: my-image:latest
     restart: unless-stopped
-    logging:
-      driver: json-file
 ```
+
+Write log output to stdout and stderr. Do **not** add a `logging:` block for an
+NCOS deployment: the engine attaches the syslog driver regardless, so container
+output goes to the router log and `container logs` commonly returns nothing. Read
+it with `log show -i -s <container_name>`.
 
 ## Full Compose Example
 
@@ -362,8 +365,6 @@ services:
       - LOG_LEVEL=info
     mem_limit: 128M
     restart: unless-stopped
-    logging:
-      driver: json-file
 
 networks:
   container-lan:

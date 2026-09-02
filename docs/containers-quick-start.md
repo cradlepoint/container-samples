@@ -128,17 +128,27 @@ container exec <container_name> sh
 
 ## Logging
 
-Add logging to the Compose YAML to enable container logs:
+**Do not add a `logging:` block for an NCOS deployment, and do not expect
+`container logs` to work.** Observed on a router: the engine attaches the
+**syslog** driver with `tag: {{.Name}}` and an empty `LogPath` regardless of what
+the compose file asks for, so a container's stdout and stderr go to the **router
+log**. `container logs <container_name>` commonly returns nothing as a result,
+which is normal rather than a fault.
 
-```yaml
-services:
-  my_service:
-    image: 'my_image:tag'
-    logging:
-      driver: json-file
+Read the output with the `log` CLI instead:
+
+```bash
+log show -i -s <container_name>     # -i case-insensitive, -s search message text
+log show -f 200                     # follow, with history
 ```
 
-View logs with: `container logs <container_name>`
+stdout arrives as `INFO` and stderr as `ERR`, so a chatty third-party daemon
+logging to stderr fills the router's *error* log. The buffer is shared with the
+whole router and rolls over quickly — a verbose daemon has been observed evicting
+a container's own startup lines within about three minutes.
+
+A `json-file` block is still useful in a *local* development compose file, where
+it does work.
 
 ## File Ownership Caveat
 

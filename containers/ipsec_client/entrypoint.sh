@@ -36,8 +36,12 @@
 #   7. supervise + watchdog     -- charon death exits non-zero; a missing SA is re-initiated
 set -eu
 
-log() { echo "ipsec_client: $*"; }
-fail() { echo "ipsec_client: ERROR: $*" >&2; exit 1; }
+# Print the message and nothing else. The container runtime already stamps each
+# line with a timestamp and the container name on its way to the router log, so
+# adding either here just duplicates it. `ERROR` stays because severity is part
+# of the message, not metadata the log carrier supplies.
+log() { echo "$*"; }
+fail() { echo "ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- configuration
 : "${VPN_GATEWAY:=}"
@@ -50,23 +54,27 @@ fail() { echo "ipsec_client: ERROR: $*" >&2; exit 1; }
 : "${VPN_LOCAL_ID:=${VPN_USERNAME}}"
 : "${VPN_EAP_METHOD:=eap-mschapv2}"
 : "${VPN_REMOTE_TS:=0.0.0.0/0}"
-# Defaults match a common FortiGate dialup profile: phase 1 aes256-sha256 with
-# dhgrp 14, phase 2 aes256-sha256 with pfs disabled -- which is why the ESP
-# proposal carries no DH group. Adding one where the gateway has PFS off makes
-# the CHILD_SA proposal fail to match.
+# Defaults suit a common dialup profile: aes256-sha256 with a 2048-bit DH group
+# for IKE, aes256-sha256 for ESP. The ESP proposal deliberately carries no DH
+# group, because adding one where the gateway has PFS disabled makes the
+# CHILD_SA proposal fail to match. Both must overlap what the gateway offers.
 : "${VPN_IKE_PROPOSALS:=aes256-sha256-modp2048,aes128-sha256-modp2048,default}"
 : "${VPN_ESP_PROPOSALS:=aes256-sha256,aes128-sha256,default}"
 
 # How the *gateway* authenticates itself: pubkey (certificate) or psk.
-# Certificate is the common case for FortiGate dialup with EAP -- `authmethod:
-# signature` with a `certificate:` entry and no psksecret. This side always
-# authenticates with EAP either way.
+# Certificate is the common case for a dialup gateway using EAP, so it is the
+# default; use psk only where the gateway really has a shared secret configured.
+# This side always authenticates with EAP either way.
 : "${VPN_GATEWAY_AUTH:=pubkey}"
 : "${VPN_CA_CERT_B64:=}"
 : "${VPN_DPD_DELAY:=30s}"
 : "${VPN_MSS_CLAMP:=1}"
 : "${VPN_FAIL_CLOSED:=1}"
 : "${VPN_WATCHDOG_INTERVAL:=20}"
+# Heartbeat interval for the periodic status line. Transitions are logged the
+# moment they happen regardless of this; it only bounds how often an unchanged
+# state is restated. 0 disables the heartbeat and logs transitions only.
+: "${VPN_STATUS_INTERVAL:=300}"
 
 # auto | xfrm | userspace
 : "${VPN_DATA_PATH:=auto}"
@@ -131,33 +139,103 @@ fi
 # and kernel configuration cannot be established from a development machine --
 # the router's engine and kernel are the only authority.
 preflight_failed=0
+# Both helpers print the command's own error text on failure. A preflight exists
+# so that one deployment answers the platform questions from `container logs`, and
+# a verdict without the reason answers only half of them -- "not permitted",
+# "no such file or directory" and "table does not exist" send you to three
+# different fixes, and discarding stderr makes them indistinguishable.
+_preflight_err=/tmp/preflight.err
 check() {
     label="$1"; shift
-    if "$@" >/dev/null 2>&1; then
+    if "$@" >/dev/null 2>"$_preflight_err"; then
         log "PREFLIGHT ok      : ${label}"
         return 0
     fi
     log "PREFLIGHT FAILED  : ${label}"
+    _report_preflight_error
     preflight_failed=1
-    return 1
+    # Deliberately returns 0. These are called as bare top-level commands, and
+    # `set -e` exits the script on a non-zero one -- which aborted the whole
+    # preflight at the FIRST failure, so the remaining grants went unreported and
+    # the explanatory message below never printed. The point of a preflight is
+    # that one deployment answers every platform question, so a failing check
+    # must record itself in preflight_failed and let the run continue.
+    return 0
 }
 probe() {
     # Like check(), but informational: reports capability without failing startup.
     label="$1"; shift
-    if "$@" >/dev/null 2>&1; then
+    if "$@" >/dev/null 2>"$_preflight_err"; then
         log "PREFLIGHT ok      : ${label}"
         return 0
     fi
     log "PREFLIGHT absent  : ${label}"
+    _report_preflight_error
     return 1
+}
+_report_preflight_error() {
+    [ -s "$_preflight_err" ] || return 0
+    # First two lines only: iptables in particular repeats itself.
+    head -2 "$_preflight_err" | while read -r line; do
+        [ -n "$line" ] && log "                    reason: ${line}"
+    done
+    : > "$_preflight_err"
 }
 
 check "CAP_NET_ADMIN can add a policy routing rule" \
     sh -c 'ip rule add to 192.0.2.0/24 lookup main pref 32000 && ip rule del to 192.0.2.0/24 lookup main pref 32000'
-check "netfilter nat table writable" \
-    sh -c 'iptables -t nat -N preflight && iptables -t nat -X preflight'
-check "netfilter filter policy writable" \
-    sh -c 'iptables -t filter -N preflight && iptables -t filter -X preflight'
+
+# ------------------------------------------------------- netfilter backend
+# Debian ships iptables with the nf_tables backend by default and keeps the
+# legacy one alongside it. They are not interchangeable here: they talk to
+# different kernel subsystems, so whichever one this kernel lacks fails while the
+# other works. A container that only ever calls `iptables` therefore fails on a
+# kernel that would have supported it via the other backend, and the error text
+# ("table does not exist", typically) does not say so.
+#
+# So probe both and use whichever answers. VPN_IPTABLES_BACKEND=nft|legacy forces
+# one, for the case where both load but only one actually filters.
+: "${VPN_IPTABLES_BACKEND:=auto}"
+case "$VPN_IPTABLES_BACKEND" in
+    auto|nft|legacy) ;;
+    *) fail "VPN_IPTABLES_BACKEND=${VPN_IPTABLES_BACKEND} is not one of: auto, nft, legacy" ;;
+esac
+
+_backend_works() {
+    # A NAT-table write is the demanding case: it needs the nat chain type, not
+    # just the binary. Test what the container actually depends on.
+    "$1" -t nat -N preflight >/dev/null 2>&1 || return 1
+    "$1" -t nat -X preflight >/dev/null 2>&1 || true
+    return 0
+}
+
+IPT=''
+case "$VPN_IPTABLES_BACKEND" in
+    nft)    IPT=iptables-nft ;;
+    legacy) IPT=iptables-legacy ;;
+    auto)
+        for candidate in iptables-nft iptables-legacy; do
+            if _backend_works "$candidate"; then
+                IPT="$candidate"
+                break
+            fi
+            log "netfilter backend ${candidate}: no usable nat table, trying the next"
+        done
+        ;;
+esac
+
+if [ -z "$IPT" ]; then
+    # Fall back to the default binary purely so the checks below produce a real
+    # error message naming the reason, rather than this line being the last word.
+    IPT=iptables
+    log "netfilter: neither backend has a usable nat table -- see the reasons above"
+fi
+log "netfilter backend: ${IPT} ($("$IPT" --version 2>/dev/null | head -1))"
+
+check "netfilter nat table writable (${IPT})" \
+    sh -c "${IPT} -t nat -N preflight && ${IPT} -t nat -X preflight"
+check "netfilter filter policy writable (${IPT})" \
+    sh -c "${IPT} -t filter -N preflight && ${IPT} -t filter -X preflight"
 
 ip_forward="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo unknown)"
 if [ "$ip_forward" = "1" ]; then
@@ -365,45 +443,62 @@ fi
 # interface name.
 setup_firewall() {
     if [ "$VPN_FAIL_CLOSED" = "1" ]; then
-        iptables -P FORWARD DROP
+        $IPT -P FORWARD DROP
         log "FORWARD policy DROP (fail-closed: LAN clients have no path while the tunnel is down)"
     else
         log "WARNING: VPN_FAIL_CLOSED=0 -- traffic will fall back to the router and leave"
         log "         this container unencrypted whenever the tunnel is down."
     fi
 
-    iptables -A FORWARD -o "$VPN_IF_NAME" -j ACCEPT
-    iptables -A FORWARD -i "$VPN_IF_NAME" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    $IPT -A FORWARD -o "$VPN_IF_NAME" -j ACCEPT
+    $IPT -A FORWARD -i "$VPN_IF_NAME" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
     # All LAN clients are translated to the address the gateway assigns, which
     # is what makes this outbound-only: the far side cannot initiate inward.
-    iptables -t nat -A POSTROUTING -o "$VPN_IF_NAME" -j MASQUERADE
+    $IPT -t nat -A POSTROUTING -o "$VPN_IF_NAME" -j MASQUERADE
 
     if [ "$VPN_MSS_CLAMP" = "1" ]; then
-        iptables -t mangle -A FORWARD -o "$VPN_IF_NAME" \
+        $IPT -t mangle -A FORWARD -o "$VPN_IF_NAME" \
             -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
         log "MSS clamped to path MTU on ${VPN_IF_NAME}"
     fi
 }
 
 setup_routing() {
+    # Keep LAN-destined traffic out of the tunnel, in BOTH data paths.
+    #
+    # This was originally only in the userspace branch, which is a bug worth
+    # naming: with a catch-all remote_ts, *any* table holding a default route via
+    # the tunnel also matches replies destined for the local network -- charon's
+    # table 220 behind its "from all" rule in userspace mode, and the explicit
+    # table below in xfrm mode. The failure differs in blast radius rather than
+    # in kind: LAN clients see one-way loss, and if the container's own address
+    # is inside LAN_SUBNETS, its own replies leave via the tunnel too, which
+    # takes out management access to anything on that segment.
+    #
+    # pref 100 is deliberately lower than the pref 200 rule below, so this is
+    # consulted first.
+    for subnet in $(echo "$LAN_SUBNETS" | tr ',' ' '); do
+        [ -n "$subnet" ] || continue
+        ip rule add to "$subnet" lookup main pref 100
+        log "policy route: traffic to ${subnet} uses the main table, not the tunnel"
+    done
+
     if [ "$DATA_PATH" = userspace ]; then
-        # charon installs its own routes in table 220 behind a "from all" rule.
-        # With a catch-all remote_ts that default also matches replies destined
-        # for the LAN, sending return traffic back up the tunnel -- every client
-        # then sees one-way loss while the far end looks healthy.
-        for subnet in $(echo "$LAN_SUBNETS" | tr ',' ' '); do
-            [ -n "$subnet" ] || continue
-            ip rule add to "$subnet" lookup main pref 100
-            log "policy route: replies to ${subnet} use the main table, not the tunnel"
-        done
+        # charon installs its own routes in table 220 behind a "from all" rule,
+        # so the exclusion above is all that is needed here.
         return
     fi
 
     # xfrm mode: routing is explicit, in a table selected by source address, so
-    # only forwarded LAN traffic uses the tunnel. The container's own packets --
-    # including the ESP it sends to the gateway -- stay on the main table, which
-    # is what prevents a catch-all route looping the tunnel through itself.
+    # only forwarded LAN traffic uses the tunnel.
+    #
+    # NOTE the assumption in that sentence: it holds only while the container's
+    # own address is OUTSIDE every LAN_SUBNETS entry. Put the container on the
+    # same segment it serves and `from <lan>` also matches packets the container
+    # originates -- including the ESP it sends to the gateway, which would then
+    # route into the tunnel it is trying to build. Give the container its own
+    # network, or narrow VPN_REMOTE_TS so no catch-all default exists.
     for prefix in $(echo "$VPN_REMOTE_TS" | tr ',' ' '); do
         [ -n "$prefix" ] || continue
         ip route add "$prefix" dev "$VPN_IF_NAME" table "$VPN_ROUTE_TABLE"
@@ -463,18 +558,86 @@ log "configuration loaded; charon will establish and maintain the tunnel"
 # Sleeping in short steps keeps shutdown prompt: a trap does not interrupt an
 # in-progress sleep in POSIX sh, so one long sleep would delay SIGTERM handling
 # past the stop grace period and end in SIGKILL.
+#
+# It also reports state. Transitions are logged the instant they are observed,
+# because up->down and down->up are the lines an operator correlates against a
+# router event; an unchanged state is restated only every VPN_STATUS_INTERVAL so
+# a healthy tunnel does not emit a line per check.
+report_sas() {
+    # Echo swanctl's own lines rather than picking fields out of them. The column
+    # layout is not a stable interface, and a wrong pattern here would print
+    # nothing while still looking like a working check -- the failure mode is a
+    # status report that is silently empty.
+    swanctl --list-sas 2>/dev/null | grep -E 'ESTABLISHED|INSTALLED' | tr -s ' ' \
+        | while read -r line; do log "  ${line}"; done
+}
+
 SLEEP_STEP=5
 elapsed=0
+since_status=0
+down_checks=0
+tunnel_state=unknown
 
 while kill -0 "$CHARON_PID" 2>/dev/null; do
     sleep "$SLEEP_STEP"
     elapsed=$((elapsed + SLEEP_STEP))
-    if [ "$elapsed" -ge "$VPN_WATCHDOG_INTERVAL" ]; then
-        elapsed=0
-        if ! swanctl --list-sas 2>/dev/null | grep -q INSTALLED; then
-            log "watchdog: no installed CHILD_SA -- re-initiating"
-            swanctl --initiate --child tunnel --timeout 30 >/dev/null 2>&1 || \
-                log "watchdog: re-initiate did not complete; will retry in ${VPN_WATCHDOG_INTERVAL}s"
+    since_status=$((since_status + SLEEP_STEP))
+
+    [ "$elapsed" -ge "$VPN_WATCHDOG_INTERVAL" ] || continue
+    elapsed=0
+
+    if swanctl --list-sas 2>/dev/null | grep -q INSTALLED; then
+        state=up
+    else
+        state=down
+    fi
+
+    # Changes first, so a transition is never swallowed by a heartbeat that
+    # happened to fall in the same interval.
+    if [ "$state" != "$tunnel_state" ]; then
+        if [ "$state" = up ]; then
+            log "tunnel UP: gateway ${VPN_GATEWAY}, data path ${DATA_PATH}, interface ${VPN_IF_NAME}"
+            report_sas
+            addr=$(ip -4 -o addr show dev "$VPN_IF_NAME" 2>/dev/null | awk '{print $4}' | head -1) || true
+            if [ -n "${addr:-}" ]; then
+                log "  assigned address ${addr}"
+            fi
+        elif [ "$tunnel_state" = unknown ]; then
+            log "tunnel not established yet"
+        else
+            log "tunnel DOWN: forwarded LAN traffic is now being dropped (fail_closed=${VPN_FAIL_CLOSED})"
+        fi
+        tunnel_state="$state"
+        since_status=0
+    fi
+
+    if [ "$state" = down ]; then
+        # Re-initiate on every check, but do not narrate every attempt. A
+        # permanently unreachable gateway would otherwise emit a pair of lines
+        # per interval forever, into a log that is shared with the rest of the
+        # router. Log the first attempt, then every tenth, the way cp.py
+        # throttles repeated transport failures.
+        down_checks=$((down_checks + 1))
+        if [ "$down_checks" -eq 1 ] || [ $((down_checks % 10)) -eq 0 ]; then
+            log "watchdog: no installed CHILD_SA -- re-initiating (attempt ${down_checks})"
+            verbose_attempt=1
+        else
+            verbose_attempt=0
+        fi
+        if ! swanctl --initiate --child tunnel --timeout 30 >/dev/null 2>&1; then
+            if [ "$verbose_attempt" = 1 ]; then
+                log "watchdog: re-initiate did not complete; retrying every ${VPN_WATCHDOG_INTERVAL}s, logging every 10th"
+            fi
+        fi
+    else
+        down_checks=0
+    fi
+
+    if [ "$VPN_STATUS_INTERVAL" -gt 0 ] && [ "$since_status" -ge "$VPN_STATUS_INTERVAL" ]; then
+        since_status=0
+        log "status: tunnel ${state}, gateway ${VPN_GATEWAY}, data path ${DATA_PATH}"
+        if [ "$state" = up ]; then
+            report_sas
         fi
     fi
 done

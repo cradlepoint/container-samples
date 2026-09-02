@@ -2846,3 +2846,903 @@ sample that wraps an off-the-shelf binary:
   README which configuration path each variable applies to, and have the entrypoint
   log a warning naming any generation-only variable it found set while using a
   provided config file. Failing visibly beats documenting the trap.
+
+## 2026-09-01 — Genericizing vendor-specific material, and a check that failed silently
+
+Two small tasks on an existing sample: answering a question about an auth default
+and its trust fallback, then removing vendor-specific configuration material from
+its README. No container was built. The first lesson is a check of mine that
+returned a confident wrong answer and was caught only by re-running it.
+
+### An in-container enumeration with a guessed path fails identically to a genuine absence
+
+- Verifying which of a daemon's optional plugins the image actually contains, I
+  ran `ls /usr/lib/*/strongswan/plugins/ | grep -Ei "curl|revocation|openssl|..."`
+  inside the built base. It printed **nothing**, which reads as "none of these
+  plugins are present". The real cause was that the path does not exist on that
+  base image at all — the plugins live in `/usr/lib/ipsec/plugins/`. Re-run
+  against the correct directory: three of the five names were present. Reporting
+  the first result would have contradicted an accurate Dockerfile comment and sent
+  someone chasing a packaging defect that does not exist.
+- **A negative result from a filesystem enumeration is evidence about your path,
+  not about the image**, in exactly the way this file already records for a
+  zero-result `grep` over a corpus and for a failed `pip download` (whose error is
+  identical whether the wheel is missing or the platform tag was wrong). Same
+  failure, third tool. The pattern is general enough to state once: **any command
+  whose "absent" output is an empty result needs a positive control**, or it
+  cannot distinguish absence from a wrong query.
+- Two cheap forms, either is enough:
+  - Include a token in the same command that you know **must** match. If the
+    control does not appear, the query is wrong, not the image.
+  - Resolve the location rather than guessing it — `dpkg -L <package>`,
+    `find / -name '<a-file-you-know-exists>'` — before enumerating.
+- Worth noting what nearly made this stick: the same command *did* return a real
+  hit from a second, differently-rooted path (a config file under `/etc`), so the
+  output was not empty overall and looked like a partial, discriminating result.
+  **A command that mixes two lookups can have one succeed and one silently
+  misfire**, which is more convincing than a wholly empty result and therefore
+  worse. Give each lookup its own labelled line.
+
+### The peer's vendor name is a third grep axis, alongside the feature name and the project name
+
+- Phase 2a already says to grep twice when removing something: once for the
+  feature name, once for the sample's own name. Genericizing material about a
+  third-party **peer** needs a third pass, for the vendor, product or model name —
+  and its occurrences cluster in different files than either of the other two:
+  header comment blocks, defaults with an explanatory comment above them, and
+  `environment:` comments in the compose files.
+- **Genericizing only the README, while the build files still name a vendor, is
+  worse than leaving both alone.** The README then claims generality while the
+  compose file — the artifact people actually copy and edit — still reads as
+  though one vendor is the tested and supported configuration. The reader trusts
+  the file they are editing over the prose they skimmed.
+- So the grep is not optional cleanup, it is what decides whether the change is
+  coherent. Run it first, count the hits per file, and if the out-of-scope hits
+  cannot be touched in this change (see below), say where they are rather than
+  leaving the inconsistency undocumented.
+
+### A vendor-specific translation table is often the only home for a generic fact
+
+- The table removed here mapped one vendor's configuration fields onto the
+  container's environment variables — genuinely vendor-specific, and correct to
+  delete. But several of its rows were not mappings at all: they recorded
+  behaviour of *our own artifact* that has no setting and appears nowhere else
+  (what is negotiated automatically, what a variable must match on the far end,
+  where pushed configuration actually lands). Deleting the table wholesale would
+  have silently dropped those.
+- **Before deleting a translation table, sort its rows into two piles: mappings
+  from the other system's vocabulary, and facts about your own thing that happen
+  to be documented here.** Delete the first, re-home the second.
+- This is the mirror of the standing lesson that removing a feature leaves dead
+  scaffolding behind: here removal takes **load-bearing** content with it. Both
+  come from the same root cause — the boundary of what a section is *about* is
+  not the boundary of what it *contains* — and both are only caught by reading
+  the content rather than trusting the heading.
+
+### A file's header comment describes the design at the time it was written
+
+- A header block in one build file still described a different authentication
+  default and a different data path than the entrypoint in the same directory
+  actually implements — drift from a later change to those defaults.
+- Header blocks are the worst place for a stale claim: they read as authoritative
+  design intent, they are covered by no test (tests assert what code does, not
+  what a comment says it does), and a README audit does not look at them. This is
+  the same shape as the standing rule that operator-facing strings are invisible
+  to tests, applied to comments instead of log output.
+- **When a default changes, grep the repo for the old default's value, not just
+  for the variable's name.** A grep for the variable finds the line that sets it;
+  only a grep for the old value finds the prose that still explains it.
+
+### A scope guard from an earlier entry fired, and is worth recording as exercised
+
+- The 2026-08-30 rule — "fix the documentation" means correct the document, and
+  anything better fixed in code is a finding needing its own consent — applied
+  directly: the vendor name also appears in an entrypoint and a compose file, and
+  those were reported rather than edited. Same for the stale header comment above.
+- Recording this because a rule that has actually caught its case is worth more
+  than one that has only been asserted, and this file already values knowing which
+  is which. The rule was cheap to follow here: naming the remaining files and
+  offering to do them costs one paragraph and leaves the decision where it
+  belongs.
+
+## 2026-09-01 (second entry) — Asserting on a daemon CLI's output, and a false premise with two halves
+
+Continuation of the same session: fixing the comment drift reported earlier, then
+settling a question about a fallback's actual behaviour by running it. The
+verification took three attempts and the first two produced numbers that meant
+nothing, which is where most of the value is.
+
+### A daemon client's output can be prefixed with startup diagnostics, so a bare count is meaningless
+
+- Asserting on how many trust anchors a daemon had actually loaded, I ran its
+  client CLI and counted lines. The number was ~1700 for what should have been a
+  few hundred records, because **the client's stdout was prefixed with roughly
+  thirty `plugin '<x>': failed to load` lines** — the same noise this repo already
+  documents for the *daemon's* startup log, appearing in the *client's* output
+  where nothing warns about it. A `wc -l` over that is a sum of two unrelated
+  things.
+- Worse, my first two grep patterns were guesses at the record format and both
+  matched nothing, returning `0` for a set that actually had 150 members. `0` is
+  the most dangerous possible answer here, because it looks like a real finding
+  contradicting everything else measured.
+- **The sequence that works, and it is worth doing in this order every time:**
+  1. Strip the diagnostics, then dump **one record verbatim** and read the actual
+     format. Do not guess at leading whitespace, field labels or a `--type`-style
+     filter flag.
+  2. Derive the pattern from what you just read.
+  3. Only then count.
+  One extra command, versus a confidently wrong number.
+- Generalises to any container wrapping an off-the-shelf daemon: its CLI is a
+  program whose output format you have not read yet, and treating it as a clean
+  data source is the mistake. This extends the standing "verify the check before
+  suspecting the code" rule with the specific reason a check of this shape fails.
+
+### Cross-check a count against an independently derived one
+
+- The final claim rested on **four** measurements that had to agree: files placed
+  on disk, distinct subjects extracted with a different tool entirely, the load
+  lines the daemon emitted while ingesting them, and the records its client
+  listed afterwards. All four came to the same number, which is what makes the
+  claim solid.
+- Any one of them alone would have been a single grep against a format I had
+  already gotten wrong twice. **When a number is the evidence for a
+  security-relevant claim, derive it a second way with a different tool.** If the
+  two disagree, at least one pattern is wrong — which is exactly the information a
+  single measurement cannot give you.
+- This is the cheap general form of the positive-control rule written earlier the
+  same day: a control proves your query matches *something*, and an independent
+  count proves it matches *the right number of things*.
+
+### The positive-control rule fired one turn after being written
+
+- Recording this because the file values knowing which guards have actually caught
+  their case. The rule appended earlier today — an empty enumeration result is
+  evidence about the query, not the corpus — is precisely what stopped me
+  reporting "0 anchors loaded" from a bad pattern. It cost one re-run.
+- Worth noting the rule generalised further than it was written: I wrote it for a
+  *filesystem path* guess, and it applied unchanged to a *CLI output format* guess.
+  Both are "I assumed the shape of something I had not looked at."
+
+### A false premise in a question can be wrong in more than one place
+
+- The question asked whether a trust fallback "just uses the first cert it finds
+  on the router". Two independent errors: it is not the first of anything, and
+  nothing comes from the router — the material is baked into the image at build
+  time. Answering only the interesting half would have silently endorsed the
+  other, leaving the asker with a wrong mental model of where the data even lives.
+- **Decompose a premise into its clauses and check each one**, rather than
+  answering the clause that looks like the real question. A compound premise is
+  easy to half-answer because refuting one clause feels like refuting the
+  sentence.
+- This is the mirror of the standing lesson that a partial answer to a multi-part
+  question is not confirmation of the whole. There it was a human's answer being
+  over-read by me; here it is a human's *question* whose unexamined half I could
+  have left standing. Both come from a compound statement being treated as
+  atomic.
+
+### A security note should state the consequence, not just the mechanism
+
+- A configuration table described an optional pinning variable as falling back to
+  "the system trust store". Literally true, and it conveys almost nothing: the
+  consequence is that a large set of independent third parties can each satisfy
+  the trust check, and that a separate missing component means revocation is never
+  actually checked. A reader cannot derive either fact from the mechanism.
+- **This is a distinct defect class from a wrong claim or an unverified one, and
+  this file had not named it: a technically accurate description that understates
+  the posture.** It survives review precisely because nothing in it is false, so
+  there is nothing to correct — the fix is adding the consequence, not amending
+  the sentence.
+- Rule of thumb for any security-relevant setting with a permissive default or
+  fallback: state what an attacker would have to be, or have, for the fallback to
+  be exploited. "Falls back to X" is mechanism; "anyone in set X can impersonate
+  this peer, and revocation is not checked" is consequence. Related to the
+  standing rule about enumerating a set a security claim quantifies over — that
+  one catches a *hidden gap*, this one catches a *hidden magnitude*.
+
+### Scope re-verification to what the edit could plausibly have changed, and say what you skipped
+
+- The code change in this turn was comment-only. Phase 2b says build both
+  architectures, and that rule exists to catch per-architecture package and asset
+  availability — something a comment cannot affect. Building arm64 confirmed the
+  file still parses; running a second emulated build of identical instructions
+  would have added minutes and no information.
+- **The useful discipline is not "run every step" or "skip what feels
+  unnecessary", it is naming what each verification step is capable of detecting
+  and then saying which ones you skipped and why.** I reported the arm/v7 build as
+  reasoning rather than measurement, which keeps the distinction this repo cares
+  about intact while staying proportionate.
+- Same family as the standing proportionality lesson (verification depth is set by
+  what the design needs to guarantee), applied to *re-*verification after a small
+  edit rather than to initial verification.
+
+## 2026-09-01 (third entry) — Adding status logging, and recording a user's claim as fact
+
+Added state and transition logging to an existing sample's supervisor loop, after
+a request that narrowed several times. The lead lesson is mine: I wrote an
+unverified platform claim into a README because it came from the user rather than
+from a test.
+
+### A claim from the user is still a claim, and a README is still a fact-carrying document
+
+- Told that container stdout reaches the router's own log, I wrote into the
+  README: "which the container runtime collects and NCOS carries into the router
+  log", flatly, present tense. Nothing in this repo documents that, no test of it
+  is on record, and the reference doc says only that `log()` output is collected
+  by `container logs`. The user may well be right — they know the platform far
+  better than the docs do — but **I recorded it with the same confidence I would
+  have used for something I had run**, which is precisely the failure this file
+  has now logged half a dozen times from other directions.
+- What makes a user-supplied claim *harder* to catch than one of my own guesses:
+  a guess feels like a guess, whereas being told something by the domain expert
+  feels like being informed. Both end up as the same sentence in a document that
+  outlives the conversation, and the reader cannot tell which one it was.
+- **The fix is not to doubt the user, it is to preserve provenance.** State the
+  part that is certain as fact, and mark the rest as unverified with the probe
+  that would settle it. Corrected the README to say `container logs` is the
+  supported path and that merging into `status/log` is not verified here, and
+  added the same distinction plus a one-command probe to the SDK reference.
+- Worth noting the asymmetry in cost: if the claim is true, the cautious wording
+  costs a reader nothing. If it is false, the confident wording sends someone
+  building a monitoring integration on a channel that does not carry their data.
+
+### Reflect on the turn's own output, not only on the task
+
+- I only found the overclaim because the reflection pass re-read what I had
+  written rather than only recalling what I had done. The sentence had gone into
+  the README minutes earlier and read perfectly naturally.
+- **Add "re-read the prose I wrote this turn, looking for claims I did not test"
+  to the end of any turn that touched documentation.** This is the same
+  sweep-your-own-output discipline already recorded for cross-references written
+  in the current turn and for auditing earlier claims against a newly written
+  rule; the new part is that it applies to *ordinary descriptive sentences*, not
+  just to citations and explicit capability claims.
+
+### An application log prefix can duplicate what the log carrier already records
+
+- The question "why is the prefix there at all?" turned out to have a real answer:
+  the `json-file` driver stamps a timestamp per entry and the log is already
+  per container, so an application-added timestamp and source name are duplicates.
+  The shared client's `log()` adds both, and this repo's guidance to set
+  `CP_APP_NAME` reads as though the prefix is always desirable.
+- It is not a defect — `APP_NAME` is also protocol data for `alert()`, and it
+  genuinely disambiguates when several services write to one place — but a shell
+  entrypoint printing directly to stdout should generally emit the bare message.
+  **Before adding metadata to a log line, check what the transport already
+  records.** Duplicated timestamps are the visible symptom; the underlying
+  question is which layer owns which field.
+- General shape, beyond logging: whenever an application adds framing (a
+  timestamp, an identifier, a severity, a sequence number), establish whether the
+  carrier supplies it. Severity usually survives that test because no carrier
+  infers it; source and time usually do not.
+
+### Transition-only logging and heartbeat-only logging are both wrong
+
+- Logging on every check buries the transitions. Logging *only* transitions makes
+  a healthy steady state indistinguishable from a dead supervisor loop — silence
+  means both "nothing changed" and "the watchdog stopped running".
+- **A supervisor needs both: emit on change, plus a sparse heartbeat restating the
+  current state.** This refines the standing rule about alerts ("send transitions
+  and exceptions, not periodic samples"), which is right for a rate-limited
+  human-facing channel and incomplete for a log that is also the only liveness
+  evidence.
+- Measured the noise rather than guessing at it: the naive version produced 12
+  lines in 55 seconds against an unreachable peer. Throttling repeated recovery
+  narration to the first attempt and every tenth took a 75-second run from ~26
+  lines to 4. **Count the lines a failure mode produces before deciding the
+  logging is reasonable** — a shared, size-limited router log makes this a real
+  constraint rather than a matter of taste, and the number is one `grep -c`.
+
+### Shadow the status command to induce a state you cannot otherwise reach
+
+- Verifying down-to-up transition logging needed a session that could not exist
+  locally. Shadowing the status-reporting binary on `PATH` from a throwaway
+  wrapper entrypoint produced the transition on a timer, which exercised the
+  detection, the once-per-change behaviour, and a guard that only runs in the
+  reached state — that last one mattered, since it confirmed the guard does not
+  trip `set -e` when the data it looks for is absent.
+- Cheaper than running a real peer when **only your own state machine** is under
+  test. Complementary to, not a replacement for, the peer-in-a-second-container
+  approach already recorded here.
+- **Say what it does not show.** The stub's output is your own invention, so it
+  verifies control flow and nothing about the real tool's format. That distinction
+  is exactly why the code under test echoes the tool's lines instead of parsing
+  columns out of them — and that guard, written earlier the same day, is what kept
+  the stub from being able to hide a real bug.
+
+### A verification build can silently collide with the user's own image tags
+
+- After removing my verification tag, a pre-existing image of the user's appeared
+  untagged, with their `:latest` now pointing at an image created during my
+  session. The consistent explanation is content-addressable dedup: the same
+  Dockerfile built under two different tags at about the same time yields one
+  image object carrying both, and removing one tag leaves the other.
+- Nothing was lost, and `docker image rm <tag>` behaving as tag removal rather
+  than object deletion is what made it safe. But I could not fully account for
+  the tag movement, and **that is the point worth recording: report an
+  unexplained change to shared local state rather than tidying past it.**
+- Two practical rules: **remove verification images by tag, never by image ID**,
+  since an ID may carry tags you do not own; and when local state looks damaged,
+  check `docker image ls --no-trunc` before concluding anything — the IDs
+  distinguish "your build collided with theirs" from "you deleted their image",
+  which look identical in the default output.
+
+### A request that narrows repeatedly is a requirement being discovered
+
+- The ask moved from a web interface with configuration override, to status-only,
+  to no web interface, to logging, to which log, to the line format. Each step was
+  a reduction of the previous one.
+- Building the first form would have wasted the most work; the eventual answer was
+  a few lines in an existing loop. **When a request narrows more than once, treat
+  the trend as the signal and ask what the user needs to see rather than
+  implementing the current phrasing.** The underlying need here — "can I tell what
+  this thing is doing?" — was answerable from what already existed plus the one
+  genuine gap (no transition logging), and naming that gap early would have
+  short-circuited the whole sequence.
+- Related standing rule, from the other side: do not carry an earlier
+  recommendation forward once the requirement changes. Here the requirement changed
+  four times in one sitting, and only the last one was worth building against.
+
+## 2026-09-02 — A real failure log bypassed the verification gates
+
+The user pasted router logs showing a preflight failure. Diagnosing it exposed two
+genuine defects in the preflight pattern this repo recommends, and one repeat
+offence of mine that the user had to catch. The repeat offence leads, because the
+trigger was new.
+
+### An observed failure creates urgency that walks past the gates
+
+- Given a log line showing a netfilter check failing on hardware, I reached for the
+  local Docker harness, formed a hypothesis about the cause (a userspace backend
+  mismatch), and **built a mechanism to fix it** — all without any evidence from
+  the router about why the check failed. The user asked whether I was testing on
+  the machine rather than the router, then asked whether steering specifically told
+  me not to. It does, in two places.
+- The already-recorded version of this failure (2026-08-18, fourth entry) blamed
+  momentum: an earlier question in the session was legitimately answerable locally,
+  so the harness was warm. **That was not the trigger this time.** The trigger was
+  having a real error in hand. An unexplained failure produces pressure to explain
+  it, and under that pressure naming a plausible mechanism *feels like diagnosis*
+  rather than like the speculation it is. A bare open question does not generate
+  that pressure, which is why the gate holds more easily there.
+- **Building a fix on an unverified cause is worse than running the wrong
+  experiment**, because the code then stands as an argument for the guess. A future
+  reader finds a backend-selection mechanism and reasonably infers that a backend
+  problem was diagnosed. Nothing in the artifact records that it was a hypothesis.
+- The discipline that would have worked, and is now a clause under Phase 1 gate 2b:
+  separate what the output **shows** (this check failed, that one passed, so the
+  capability is partly granted) from what would **explain** it (several candidates,
+  different fixes), then make the next step produce the *discriminator* rather than
+  shipping a mechanism that assumes one candidate. Here the discriminator was one
+  line of error text the preflight was throwing away.
+- Also worth noting what my local run genuinely did establish — image contents, and
+  that my own script's control flow was broken — versus what it could not, which
+  was anything about why the router's kernel or engine refused. Both were in the
+  same command output, which is precisely why the boundary needs stating out loud
+  rather than assumed to be obvious.
+
+### `set -e` silently defeats the whole point of a preflight
+
+- A preflight exists so one deployment answers every platform question. The helper
+  returned `1` on failure and was called as a bare top-level command, so under
+  `set -e` the script **exited at the first failure** — every later check
+  unreported, and the summary explaining what to do never printed. The operator saw
+  one failure out of eight checks and no explanation, which is why the pasted log
+  looked truncated.
+- Nastier than it sounds because the same file can correctly contain both kinds of
+  helper: one whose result is consumed by `if probe ...; then` is safe returning
+  non-zero, since a command inside `if` does not trip `set -e`. **The difference is
+  in how each is called, not how it is defined**, so reviewing the function bodies
+  tells you nothing. Check the call sites.
+- General rule for any entrypoint using `set -e`: a validation helper meant to
+  collect multiple results must record into a flag and `return 0`, with the decision
+  taken at the end. Recorded in the guide's preflight section with the shape.
+
+### A check that hides stderr answers half the question
+
+- `>/dev/null 2>&1` on the probed command reduces the result to "it failed". The
+  command's own message is the discriminator: `Operation not permitted` points at
+  capability policy, `table does not exist` at the kernel or a wrong userspace
+  backend, `No such file or directory` at a missing device. Three different fixes,
+  indistinguishable in the log.
+- This is what forced the guessing described above — the information that would have
+  settled it had been deliberately discarded by the code I was debugging.
+- **Any diagnostic that reports a verdict should report the reason with it.** One or
+  two lines of captured stderr under the verdict turns a second round trip into no
+  round trip. Same family as the standing rule that a preflight failure should name
+  the compose key that would fix it: the point of the output is to make the next
+  action obvious.
+
+### Scan user-pasted output for answers to questions you did not ask
+
+- The pasted log incidentally settled a repo question I had marked UNVERIFIED an
+  hour earlier: the lines showed the log carrier prefixing a timestamp, a level and
+  the container name, which both confirms container stdout reaches a router-side log
+  view and justifies printing bare messages. That had nothing to do with why the
+  user pasted it.
+- **Diagnostic output supplied for one purpose frequently contains evidence for
+  another.** Read it once for the reported problem and once for anything the repo
+  currently records as unknown. Then record the finding properly — I still had to
+  note that model and firmware were absent, and that the paste does not distinguish
+  `status/log` from an NCM container-log view, so the observation is "seen on at
+  least one router" rather than fleet-wide.
+
+### Writing a rule in reaction to your own mistake pulls toward absolutism
+
+- Asked to put the router-not-PC framing early in steering, my first draft said the
+  development machine "is a build host and nothing more". The user corrected it:
+  local testing is useful for quick iteration, it just has to be validated on the
+  router. My version would have discouraged a practice this same file spends
+  paragraphs recommending, and an over-strict rule either gets ignored or causes
+  real waste.
+- **A rule written immediately after being caught in the opposite error tends to
+  overshoot.** The fix is to state what the tool *is* good for alongside what it
+  cannot answer, so the reader gets a calibration rather than a prohibition. The
+  final framing — "local testing filters problems; the router is what validates",
+  plus one narrow class that is genuinely worse tested locally than not at all —
+  carries the same constraint without the collateral damage.
+- Generalises to any guardrail added in response to an incident: check whether it
+  forbids things that were never the problem.
+
+### An interrupted tool call can leak a running container
+
+- A `docker run --rm` cancelled mid-execution left the container **running**: the
+  CLI was killed, the container was not, and `--rm` only fires on exit. It then
+  held a reference to the image, so cleanup failed with `must force` and the image
+  appeared undeletable for no visible reason.
+- **After any interrupted command, check for orphaned containers before concluding
+  cleanup is done.** Give test containers an explicit `--name` so an orphan is
+  identifiable as yours rather than an auto-generated name you have to inspect
+  before daring to remove it — which is exactly the check that matters when the
+  daemon is shared with the user's own work.
+- Related, and closing a thread I had left open: an image tag that appeared to move
+  during an earlier session was explained by `docker image ls --no-trunc` showing
+  `:latest` on a new ID with the old one dangling — consistent with the user
+  rebuilding, not with my removal touching their tags. **Report an unexplained
+  change to shared state, then actually go back and resolve it** rather than leaving
+  the flag standing.
+
+## 2026-09-02 (second entry) — First real deploy-and-debug loop against a router
+
+Built, pushed, deployed and debugged against hardware. Root cause of the failure
+was found and fixed. Several documented claims turned out to be wrong, and most of
+the wasted effort came from not confirming what I was actually connected to.
+
+### Confirm the device and the project before diagnosing anything
+
+- Roughly half this session went into diagnosing why a container would not appear,
+  produced no logs, and would not start. The project I was operating on was a
+  leftover placeholder running an entirely different image, on a **different
+  router** — the host in `.env` pointed elsewhere. Every symptom was consistent
+  with my theory of the moment, and none of it was real.
+- One call would have ended it immediately: dump the deployed compose from
+  `config/container/projects[].config` and read it. It shows the image, the tag,
+  the environment, and whether the project is even the thing you think it is.
+- **The deployed config is ground truth; your local files are not.** They can
+  differ by a stale host, a project name that means something else, a missing tag,
+  an env var edited on the device, or a compose block the engine silently
+  overrode. Read it *first*, before forming any hypothesis. Now Phase 2c step 7b.
+- This is the same family as "verify the platform before debugging your artifact",
+  one level further out: verify you are pointed at the right platform before
+  verifying the platform.
+
+### `container logs` is often empty, and that is by design
+
+- The engine attaches the **syslog** driver with `tag: {{.Name}}` and an empty
+  `LogPath`, ignoring a compose `logging: driver: json-file` request entirely. So
+  `container logs <name>` returns nothing and the output is in the **router log**,
+  read with `log show -i -s <container_name>`.
+- The guide said to use the `json-file` driver "for log access via `container
+  logs`". That is wrong on this platform and was never tested. Corrected, along
+  with the CLI list, which did not mention the `log` command at all — a gap I only
+  closed because the user pasted its usage text.
+- **stdout arrives as `INFO`, stderr as `ERR`.** A wrapped daemon that writes
+  routine chatter to stderr therefore fills the router's *error* log at ERR
+  severity no matter what the daemon considers the severity to be. Worth checking
+  which stream a third-party process uses before shipping it.
+- Generalises: **a compose key the engine silently overrides is worse than one it
+  rejects.** The request looked satisfied, the driver was not what was asked for,
+  and the only way to notice was reading `HostConfig.LogConfig` in
+  `status/container`. When a compose option matters, read back what the engine
+  actually configured rather than trusting the file.
+
+### A verbose dependency will evict your own diagnostics from a shared log
+
+- The wrapped daemon was configured with three debug subsystems at level 1. It
+  produced hundreds of lines per connection attempt and pushed the container's own
+  startup output out of the router's log buffer within about **three minutes** — so
+  the preflight lines, the whole point of which is to answer platform questions
+  from one deployment, were gone before anyone read them.
+- The log buffer is shared with every other router subsystem, so **a wrapped
+  daemon's log level is a resource decision, not a preference.** Default it low,
+  expose it as an environment variable, and keep your own status lines sparse
+  enough to survive alongside it.
+- Sharpens the earlier lesson about throttling repeated recovery narration: that one
+  was about your own lines being noisy, this one is about someone else's lines
+  destroying yours. Both come from the log being a shared, size-limited resource
+  rather than a private stream.
+
+### `container exec` is weaker than the docs assume
+
+- It accepts **no shell pipelines** (`... | head` fails with `Invalid command:
+  head`), and its output did **not** reliably come back over a non-interactive SSH
+  session — `echo` as a positive control produced nothing but `exec done.`
+- This matters well beyond convenience: this repo documents `container exec
+  <name> <one-liner>` as *the* way to answer "does the engine grant X", in several
+  places. If the output does not return, that entire probe strategy silently fails.
+- **A probe whose result must be read belongs in the container's entrypoint, with
+  the answer logged**, not in an ad-hoc `exec`. Which is the preflight pattern the
+  guide already recommends for other reasons — this is a second, independent
+  argument for it.
+
+### When an error names a value that looks correct, suspect the type
+
+- The authentication failure read as self-contradictory: the peer's certificate
+  authenticated successfully, and the very next line said the required identity was
+  a string that appeared **character-identical** to what the peer presented.
+- The two were different *types* of identifier that render as the same text — one
+  parsed as a hostname-style identity, the other as a structured directory name.
+  Fixing it meant changing the type, not the value.
+- **General rule for typed-identity protocols** (certificates, SASL, Kerberos, JWT
+  audiences, anything with an identity-type tag): when a mismatch error quotes a
+  value that looks right, the discrepancy is probably in the encoding or type, not
+  a typo. Do not spend time re-reading the string. Check what type each side
+  assigned it, and remember that a constraint on one type may only match a specific
+  field — so a certificate lacking that field fails a check its subject name would
+  otherwise satisfy.
+- Also confirmed on hardware, and worth separating from the fix: the trust chain
+  validated out of the system CA bundle, and every revocation lookup failed with
+  `no capable fetcher found` followed by `certificate status is not available`, with
+  the daemon proceeding anyway. That is the documented consequence of omitting the
+  HTTP-fetcher plugin, now observed rather than inferred.
+
+### Don't sleep in place of a state check
+
+- I inserted a 90-second sleep before listing containers, and the user rightly
+  called it out. A fixed wait is guessing dressed as patience: slower than needed
+  when the operation is quick, and a false negative when it is slow.
+- **Poll the thing that changes** — run state and `RestartCount` from
+  `status/container`, or the marker your entrypoint prints — and say what you are
+  waiting for. Now Phase 2c step 8b.
+
+### Restarting a LAN-attached container can cut your own path to the router
+
+- Immediately after a `container stop` / `container start` on a project attached to
+  a LAN-bound custom network, the router became unreachable from my machine on
+  ICMP, SSH and HTTP, while my default gateway on the same subnet answered
+  normally. The user confirmed the router itself was fine, so it was my path to it.
+- Cause unverified and I am not claiming one. The general point stands regardless:
+  **a container on a LAN-bound network shares a segment with your management path**,
+  so restarting it is not a self-contained action. Before an iteration loop that
+  will restart such a container repeatedly, establish an out-of-band path, and when
+  reachability drops, test a *second* target on the same segment before concluding
+  the router is down — that one check distinguished "router down" from "my path
+  down" here and was worth the three seconds.
+
+### Communication: lead with the finding, not the narrative
+
+- The user twice said they could not tell what I had actually done. In a live debug
+  loop that is a real cost, not a style note — they are waiting to act on a result.
+- **State the finding and the next action first, and keep the reasoning to what
+  changes a decision.** The reflection files are where the reasoning belongs; a
+  debug turn wants the answer.
+
+## 2026-09-02 (third entry) — Shipped a bug this file already described
+
+The tunnel came up on hardware after fixing the identity type. Then the user lost
+LAN access to the router, and reading my own code found a defect that this file had
+already documented as a general lesson on 2026-08-18. Worth recording *why* the
+existing lesson did not prevent it.
+
+### A capability-selected branch is never executed, not merely under-tested
+
+- The sample chooses between a kernel data path and a userspace one at startup. The
+  LAN-exclusion rule that stops a catch-all tunnel default from swallowing
+  local-destined traffic was present in the **userspace** branch and **absent from
+  the kernel branch**.
+- The reason it survived every local verification: the development machine's kernel
+  lacks the feature the kernel branch needs, so auto-selection picked userspace
+  **every single time**. That branch was not sampled less often, it was never run at
+  all — not locally, and I still do not know which branch the router picked.
+- So "test both branches" is not automatically available as advice: one branch may
+  be genuinely unrunnable on the machine you have. What *is* available:
+  - **Hoist a shared safety rule above the branch** so the untested path inherits
+    it instead of needing its own correct copy. Duplicated safety logic drifts, and
+    it drifts precisely where you cannot look. This is the fix I made.
+  - **Force the branch explicitly during verification** rather than letting an
+    `auto` probe choose, and record which branch each run exercised. An `auto`
+    default means not knowing what was tested.
+  - **Diff the branches line by line** and treat a rule present in one and missing
+    in the other as a defect until proven otherwise.
+- A comment is not evidence of parity. Mine read "these rules are identical for both
+  data paths -- that is the point of giving both the same interface name", sitting a
+  few lines above the place where they were not identical. **A comment asserting an
+  invariant is a claim to verify, not a reason to skip verifying.**
+
+### An existing lesson prevents nothing if the guard it produced is per-branch
+
+- The 2026-08-18 entry "A catch-all route in the container's own namespace captures
+  its own return traffic" describes this exact failure, from direct observation. I
+  had read it, and implemented the guard — once.
+- The gap between "knowing the failure mode" and "the code being safe from it" is
+  where the branch lives. **When acting on a lesson from this file, check that the
+  fix covers every path, not the path you happened to be editing** — which is the
+  same discipline already recorded for fixing a hazard in sibling call paths, now
+  arriving through runtime branching instead of through separate functions.
+
+### A rule keyed on a source subnet has an unstated topology precondition
+
+- `ip rule add from <served-subnet> lookup <tunnel-table>` is correct only while the
+  container's own address is **outside** that subnet. Put the container on the
+  segment it serves and the rule also matches packets the container originates,
+  including the tunnel's own outer packets, which then route into the tunnel being
+  built.
+- **State a rule's topology assumption next to the rule, and prefer checking it at
+  startup.** A container can compare its own address against the subnets it was told
+  to serve and refuse or warn on overlap. An assumption that lives only in the
+  author's head reads as unconditional to everyone else.
+
+### Deploying a forwarding container can cost you access to the router
+
+- Management access to the router was lost from the LAN while a full-tunnel
+  container sat on that same LAN. Cause still not proven — the discriminating test
+  (stop the container, see if access returns) has not been run — but the risk is
+  structural and does not need this instance proven: **the segment a forwarding
+  container serves is usually the segment you manage the router from.**
+- Two habits, now in the guide: establish an **out-of-band path** before deploying
+  anything that installs a default route or broad policy rule; and when reachability
+  drops, ping a **second target on the same subnet** before concluding the device is
+  down. The second one cost three seconds here and correctly separated "router down"
+  from "my path to it is down".
+- Give such a container **its own Local IP Network** rather than the LAN it serves.
+  That removes the source-subnet overlap above and keeps a routing mistake inside
+  the container away from the management path. Note it does not by itself put the
+  container in the traffic path — that still needs the router-side policy route — so
+  the two changes are independent and both required.
+
+### The log line naming the selected branch is the one that must survive
+
+- I cannot fix the branch defect properly without knowing which path the router
+  chose, and the line reporting it had already been evicted from the router's log
+  buffer by the wrapped daemon's debug output.
+- This connects two lessons that looked separate: a verbose dependency evicting your
+  diagnostics is not merely untidy, it can remove **the single line that identifies
+  which code is running** on a device you cannot introspect. When a container
+  branches on platform capability, that line is load-bearing — log it early,
+  unconditionally, and keep the dependency quiet enough that it survives.
+
+## 2026-09-02 (fourth entry) — Preflight output closed four open platform questions
+
+The container's own startup preflight, deployed once, answered several things this
+repo had carried as UNVERIFIED for weeks. Recording the results and the two general
+lessons; details are in `docs/container-development-guide.md`.
+
+### Confirmed on a router (kernel 5.4.213-coconut+, aarch64)
+
+- `cap_add: NET_ADMIN` **is** honoured; `devices:` mapping **is** honoured; TUN
+  creation works; netfilter rule installation works; `ip_forward` is `1`.
+- **The nf_tables backend has no usable `nat` table; the legacy `ip_tables` backend
+  works.** This is the one with the widest blast radius: Debian 12 and current
+  Alpine both symlink `iptables` to the **nft** implementation, so any container
+  that calls bare `iptables` on these routers gets the backend that fails. The
+  binary runs and the syntax is accepted; only the rule insertion fails.
+- **XFRM subsystem reachable, XFRM *interfaces* absent** (`ip link add type xfrm`
+  → `Error: Unknown device type`). Two separate kernel options, and the second was
+  the one a design depended on.
+- Still unconfirmed: `CAP_NET_RAW`, and whether compose `sysctls:` is honoured.
+  Model and firmware were not captured next to the kernel version, so this is "one
+  router, one firmware".
+
+Two things generalise from that list. **A subsystem being present does not mean the
+specific feature within it is** — reachable XFRM state versus XFRM link type is the
+same trap as an apk package existing without the plugin you need. And **a
+userspace tool having two backends over the same kernel API is a portability
+hazard nothing warns you about**: the distribution picks the default, the wrong
+one fails at rule-insertion time rather than at exec time, and the two backends
+cannot see each other's rules, so mixing them yields a ruleset that looks
+half-applied.
+
+### The preflight-in-the-real-container pattern paid off exactly as documented
+
+- One deployment, one log read, and four open questions closed — including one whose
+  answer (`no usable nat table` on one backend, `ok` on the other) came from the
+  `reason:` capture added earlier the same day. Without that, the log would have said
+  only which check failed.
+- Worth stating plainly because the pattern cost a few lines: **the checks earn
+  their keep on first deployment, not later.** The argument for them had been about
+  distinguishing a withdrawn grant from an application fault after a firmware
+  upgrade — a future benefit. The immediate benefit turned out to be larger.
+- Also vindicated: logging the *selected* branch. `SELECTED data path: userspace`
+  is what told me which of two code paths was running, and therefore which of two
+  possible bugs I was looking at. On a device you cannot introspect, that line is
+  the difference between diagnosing and guessing.
+
+### A socket existing is not the daemon being ready
+
+- The entrypoint waited for the daemon's control socket file to appear, then ran the
+  control command, which failed with `Connection refused` and dumped its usage text.
+  **The file appearing and the daemon accepting connections are two different
+  events**, and `[ -S <path> ]` only tests the first.
+- Test readiness by **performing a harmless operation and retrying it**, keeping a
+  liveness check on the daemon's PID inside the loop so a daemon that dies during
+  startup fails fast rather than waiting out the timeout. Do not hardcode the socket
+  path from memory, and on timeout list the directory you were watching so the log
+  separates "never created" from "created somewhere else".
+- Same family as "installed is not loaded, and loaded is not working", one step
+  further along: **listening is not accepting.** Each transition needs its own check
+  and none implies the next.
+
+### A recovery mechanism hides startup defects
+
+- The failed config load did not surface as a failure, because the daemon had its own
+  load-at-startup action and the container had a watchdog. The session established,
+  the state looked healthy, and the only evidence was an error buried in the log.
+- **In any container with retry or self-healing logic, a working end state is not
+  evidence that each startup step succeeded.** Read the startup log even when the
+  outcome is correct — the defect surfaces later, when the mechanism that covered it
+  is the thing that breaks.
+- This is the inverse of the earlier lesson that a health check must be able to go
+  red. There the concern was a probe that cannot detect failure; here it is recovery
+  so effective that it removes the symptom while leaving the cause in place.
+
+## 2026-09-02 (fifth entry) — Two corrections, deliberately short
+
+The tunnel negotiated successfully end to end. Only two things here worth keeping,
+and one of them sharpens a claim I recorded too weakly earlier today.
+
+### `container exec` returns nothing without a TTY — not "unreliably", never
+
+- I wrote earlier that its output "does not reliably come back over a
+  non-interactive SSH session". The evidence is stronger and more useful than that:
+  **every** non-interactive attempt returned the trailing `<name> exec done.` and no
+  payload — including `echo` as a positive control — while the same command produced
+  a full listing when run moments later on the router console. A TTY appears to be
+  required.
+- The practical consequence is bigger than the wording suggests, which is why the
+  hedge was worth removing: this repo documents platform probes as
+  `container exec <name> <one-liner>` in several places, and **from a script that
+  pattern silently yields nothing at all**. An empty result is the expected output,
+  not a failed command, so it is easy to misread as a negative finding.
+- General lesson about my own record-keeping: **"unreliable" is what you write when
+  you have one data point and are hedging.** Once a second and third observation
+  agree, replace the hedge with the actual rule — a hedge left in place invites the
+  next person to retry the thing that cannot work, and it hides how firm the
+  constraint is. State the number of observations and the discriminating condition
+  instead.
+
+### A forwarding container being healthy is not the feature working
+
+- The container has been establishing its tunnel successfully for some time, with
+  every check green — and **zero bytes have ever transited it**, because the
+  router-side step that would send client traffic to it was never created. From
+  inside the container, and from every status surface it exposes, a half-finished
+  deployment is indistinguishable from a working one.
+- **A container that carries other hosts' traffic has a mandatory router-side half
+  it cannot perform itself** (a source-based policy route, or a DHCP option).
+  That belongs in the deliverable and the verification checklist, not in a
+  deployment appendix. Now Phase 2c step 8c.
+- The related reporting discipline: "negotiation succeeded" and "traffic flows" are
+  separate claims, and answering "did it work?" requires saying which one is
+  evidenced. A session established with `0 bytes, 0 packets` both directions is
+  precisely the signature of the second being untested — this is the standing
+  "control plane up is not data plane working" rule, met in the wild rather than
+  anticipated in a design review.
+
+## 2026-09-02 (sixth entry) — Advising a user through a live fault
+
+No container was built or changed. A user was debugging a deployed container that
+carried no traffic, and asked what diagnostic tools exist. My leading hypothesis was
+wrong, one command from them settled it, and my framing of a documented constraint
+cost the user confidence in the rest of the answer. The framing failure leads,
+because it is the one that damaged the interaction.
+
+### Scope a constraint to its invocation mode in the same sentence, or it reads as false
+
+- I opened a troubleshooting answer with the documented `container exec` limitation
+  ("returns no output"), qualified with "non-interactively" in the following clause.
+  The user runs it interactively at the router console, where it works perfectly, and
+  came back with "you are doing something wrong with your SSH CLI commands" plus a
+  full working paste. **The doc was accurate and my presentation was not.**
+- The mechanism of the failure is worth naming: a constraint stated first and
+  qualified second is read as unconditional, and a reader whose own usage contradicts
+  it concludes the advice is unreliable — which then discounts the *correct* material
+  underneath it. Leading with a caveat is not free.
+- **Name the invocation mode, the transport, or the environment in the same breath as
+  the limitation**, not in the qualifying clause after it. "Scripted/non-interactive
+  invocations return nothing; run by hand at the console and it works" costs the same
+  number of words and cannot be misread.
+- Root cause of my emphasis: the limitation was recorded from *this repo's own
+  tooling path*, which drives the router over non-interactive SSH. That made it feel
+  like a platform limitation when it is a limitation of one access method. **Check
+  whether a recorded constraint is a property of the platform or of the way this repo
+  happens to reach it** before repeating it to someone whose workflow differs. Recorded
+  in the guide next to the `container exec` notes.
+
+### Directional counters exonerate your side across a boundary you cannot instrument
+
+- The decisive evidence was a pair of counters: outbound non-zero and climbing,
+  inbound exactly zero. That single reading eliminated every hypothesis about the
+  container's routing, firewall and NAT, and moved the problem to a third party's
+  gateway — without access to that gateway.
+- This repo already says "assert at the endpoint that consumes the service, not at
+  the middlebox". That rule assumes the endpoint is reachable. **When the far endpoint
+  belongs to someone else, directional counters at the middlebox are the substitute**,
+  and the `>0 out / 0 in` signature is strong enough to hand over as evidence rather
+  than as a guess. The three-way table (0/0, >0/0, >0/>0) maps cleanly onto "traffic
+  never arrived", "far end silent", "return leg broken locally" and is now in the
+  guide.
+- Corollary for anything built to carry traffic: **expose per-direction counters, or
+  make the underlying ones easy to read.** A single aggregate throughput number
+  cannot make this distinction, and the distinction is the whole diagnosis.
+
+### Divide bytes by packets to find out what a counter counted
+
+- 1092 bytes over 13 packets is exactly 84 bytes each, which is `ping`'s default
+  packet size and matched what the user's own `ping` output reported sending. That
+  arithmetic attributed the counter to their specific test rather than to background
+  traffic, which a raw total cannot do.
+- **Mean packet size is an identity check on a counter**, and it costs one division.
+  Worth doing before reasoning from any counter, because "something moved" and "my
+  test moved" are different facts and only the second supports a conclusion.
+
+### A narrow traffic selector turns a traffic counter into proof of translation
+
+- The tunnel's negotiated local selector was a single assigned address while the
+  container was forwarding traffic from an entirely different subnet. So the fact that
+  the counter incremented **at all** proved the NAT rule had fired — untranslated
+  packets could not have matched the selector and would never have been counted.
+- Generalisable shape: **where a path only admits traffic bearing some property, a
+  counter on that path is evidence the property was applied.** One command, two facts.
+  And read it in reverse when the counter is zero but packets are known to arrive —
+  that points at the rule granting the property (the translation), not at routing.
+- More generally still: look for places where an existing counter or log line already
+  answers a second question, before adding instrumentation to answer it.
+
+### Do not pick a canary the far end is likely to deny on purpose
+
+- The test destination was a public DNS resolver, reached with ICMP, through a
+  third-party managed security gateway. That combination is close to the worst
+  available test: such services routinely drop ICMP to arbitrary hosts as policy, and
+  routinely block public resolvers specifically to stop clients bypassing their own
+  DNS. A failure proves nothing about the tunnel, and it is the first test everyone
+  reaches for.
+- **Choose a first-test destination the far end is meant to permit, and exercise
+  TCP.** This repo already recommends TCP over ICMP for MTU and conntrack coverage;
+  the additional reason is that ICMP and public resolvers are the traffic most likely
+  to be denied by policy before they can tell you anything. Now in the guide.
+- The general form: when testing through infrastructure governed by someone else's
+  policy, a negative result is ambiguous between "broken" and "forbidden". Pick a
+  probe that policy should allow, or the experiment cannot distinguish them.
+
+### Giving a discriminator, not a diagnosis, is what made the correction cheap
+
+- My hypothesis was wrong. It cost almost nothing, because the answer named the one
+  command that would separate the two candidate causes and said what each outcome
+  would mean. The user ran it once and the reply contained the real answer.
+- The Phase 1 gate about producing a discriminator rather than shipping a fix for an
+  unverified cause was written for my own designs. **It applies just as well to
+  user-facing troubleshooting**, where the temptation is to survey every available
+  tool. A list of tools makes the user do the diagnosis; two commands ordered by
+  discriminating power, with the meaning of each outcome stated, does it for them.
+- Related: state the hypothesis *as* a hypothesis. Doing so made "both my candidates
+  are dead" a normal outcome rather than a retraction, and the reply could move
+  straight to the new evidence.
+
+### A verified claim's mechanism can be wrong while its conclusion is right
+
+- Sweeping for one inaccuracy (`json-file` stated as *required* for `container logs`)
+  turned up the same claim in six places across four shared files, including two
+  stated as requirements and four propagating it in copyable compose examples. It had
+  been corrected in one document weeks earlier and nowhere else.
+- Also found: a paragraph whose *conclusion* was right (do not add a timestamp and
+  name to log lines, the carrier already supplies them) resting on the wrong
+  *mechanism* (naming the `json-file` driver on a platform that uses syslog). Nothing
+  in the advice changed, but the stated reason was false, so a reader checking the
+  reasoning would find it did not hold.
+- **When correcting a claim, grep for the claim rather than editing the page it was
+  reported on, and check the places that merely *rely* on it as well as the places
+  that state it.** A wrong mechanism supporting right advice survives review
+  indefinitely, because the advice is not wrong and there is nothing to correct.
+- Two adjacent sentences in one file contradicted each other outright (output is
+  retrieved with `container logs` / output goes to the router log instead), the
+  residue of an earlier partial correction. **A correction inserted above existing
+  prose needs the prose below it re-read**, or the file argues with itself.

@@ -48,15 +48,16 @@ services:
         ipv4_address: 192.168.0.2
     environment:
       - VPN_GATEWAY=always-on.vpn.example.com
-      # How the GATEWAY authenticates itself. FortiGate dialup with EAP usually
-      # uses a certificate (`authmethod: signature` with a `certificate:` entry
-      # and no psksecret) -- that is pubkey here. Use psk only if the gateway
-      # really has a psksecret. This side always authenticates with EAP.
+      # How the GATEWAY authenticates itself. A dialup gateway using EAP usually
+      # presents a certificate, which is pubkey here. Use psk only if the
+      # gateway really has a shared secret configured. This side always
+      # authenticates with EAP either way.
       - VPN_GATEWAY_AUTH=pubkey
-      # Must match what the gateway presents: normally the FQDN in its
-      # certificate's SAN, which is the same value a working iOS/Android profile
-      # puts in RemoteIdentifier. If the gateway sets a `localid`, it may send
-      # that instead -- the log names what it received on a mismatch.
+      # Must match the identity the gateway presents: normally the FQDN in its
+      # certificate's SAN, and the same value a working client profile for this
+      # gateway uses as its remote identifier. A gateway configured with an
+      # explicit local identity may send that instead -- the log names what it
+      # received on a mismatch.
       - VPN_GATEWAY_ID=always-on.vpn.example.com
       # Pin the issuing CA (base64 of the PEM, single line):
       #   base64 -w0 ca.pem
@@ -67,12 +68,12 @@ services:
       # - VPN_PSK=only-needed-when-VPN_GATEWAY_AUTH=psk
       - VPN_USERNAME=change-me
       - VPN_PASSWORD=change-me
-      # eap-mschapv2 covers FortiGate with a local or RADIUS/FortiAuthenticator
-      # user group. If the gateway negotiates something else, set it here --
-      # eap-gtc, eap-md5, eap-tls and eap-ttls are all available in the image.
+      # eap-mschapv2 covers a gateway backed by a local or RADIUS user database.
+      # If the gateway negotiates something else, set it here -- eap-gtc,
+      # eap-md5, eap-tls and eap-ttls are all available in the image.
       - VPN_EAP_METHOD=eap-mschapv2
-      # Match the gateway's phase 1 and phase 2. Note the ESP proposal carries
-      # no DH group: FortiGate phase 2 with `pfs: disable` will not match one.
+      # Match the gateway's phase 1 and phase 2. Note the ESP proposal carries no
+      # DH group: a gateway with PFS disabled on phase 2 will not match one.
       - VPN_IKE_PROPOSALS=aes256-sha256-modp2048
       - VPN_ESP_PROPOSALS=aes256-sha256
       # Kernel ESP with an XFRM interface when the kernel supports it, userspace
@@ -94,8 +95,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
-    logging:
-      driver: json-file
+    # No `logging:` block. Observed on the router: cpdockerengine ignores a
+    # json-file request and uses the syslog driver with tag {{.Name}}, leaving
+    # LogPath empty -- so `container logs <name>` returns nothing and the output
+    # is in the router log instead. Asking for json-file here does not change
+    # that, it just implies a driver you will not get.
 
 networks:
   lan:

@@ -69,8 +69,6 @@ services:
     mem_limit: 64M
     volumes:
       - $CONFIG_STORE
-    logging:
-      driver: json-file
 '''
 
 dev_router.post('config/container/projects', {

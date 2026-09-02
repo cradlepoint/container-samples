@@ -197,6 +197,45 @@ Two further points for multi-process containers:
 - **The health check must cover the process that is not PID 1.** A check that only exercises the main application will pass while the supervised daemon is dead. If the application serves HTTP, have its health endpoint open a socket to the daemon's port and fail when that connection is refused, so one check covers both.
 - **Start order matters for readability, not correctness.** Most daemons retry a refused connection, but starting the dependency first avoids a burst of connection errors that looks like a fault. Poll for the port to open before starting the consumer, and bail out early if the first process dies during the wait.
 
+### A Socket Existing Is Not the Daemon Being Ready
+
+Waiting for a daemon's control socket to appear before driving it is the right
+instinct, but **the file appearing and the daemon accepting connections are two
+different events**, and testing for the first does not establish the second:
+
+```sh
+# Not sufficient: the socket can exist while nothing accepts on it yet.
+while [ ! -S /var/run/foo.sock ]; do sleep 0.1; done
+foo-ctl load-config          # -> "Connection refused"
+```
+
+Observed exactly this: the wait loop passed, the control command then failed with
+`Connection refused` and dumped its usage text into the log. Test **readiness by
+doing the thing**, and retry it:
+
+```sh
+i=0
+until foo-ctl <a-harmless-read> >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -gt 100 ] && { echo "ERROR: daemon not accepting after 10s" >&2; exit 1; }
+    kill -0 "$DAEMON_PID" 2>/dev/null || { echo "ERROR: daemon exited during startup" >&2; exit 1; }
+    sleep 0.1
+done
+```
+
+Keep the liveness check on the daemon PID inside the loop, so a daemon that dies
+during startup fails fast instead of waiting out the timeout. And do not hardcode
+the socket path from memory — take it from the daemon's own configuration or docs,
+and on timeout list the directory you were watching, so the log distinguishes
+"never created" from "created elsewhere".
+
+**A recovery mechanism will hide this from you.** In the observed case the daemon
+had its own "load config at startup" action and the container had a watchdog, so
+the session came up anyway and everything looked healthy — the only evidence was
+the error in the log. When a container has retry or self-healing logic, a working
+end state is not evidence that each startup step succeeded. Read the startup log
+even on success.
+
 ### Daemons That Bind Loopback By Default
 
 Several common network daemons listen on `127.0.0.1` unless told otherwise, as a
@@ -358,7 +397,13 @@ services:
 - **volumes**: Named volumes for data sharing between containers
 - **devices**: Map host devices (USB serial, USB audio) into the container
 - **restart**: Use `always` or `unless-stopped` for production containers
-- **logging**: Use `json-file` driver for log access via `container logs`
+- **logging**: Omit it. Observed on a router: `cpdockerengine` ignores a
+  `json-file` request and configures the **syslog** driver with `tag: {{.Name}}`,
+  leaving `LogPath` empty — so `container logs <name>` returns nothing and the
+  output is in the **router log** instead. Asking for `json-file` does not change
+  that, it only implies a driver you will not get. See "Reading a Container's Log"
+  under Troubleshooting. A `json-file` block is still useful in a *local*
+  development compose file, where it does work
 
 ## Communicating with the Router (Config Store)
 
@@ -529,6 +574,43 @@ ports:
   - '8080:8080'        # TCP port (default)
 ```
 
+### Give Such a Container Its Own Network, Not the Segment It Serves
+
+**Put a forwarding container on its own Local IP Network rather than on the LAN
+whose traffic it carries.** Two reasons, and the second has bitten:
+
+- Any policy rule selecting traffic *by source subnet* also matches packets the
+  container itself originates, once the container's own address falls inside that
+  subnet. With a catch-all tunnel default, its replies — and the tunnel's own
+  outer packets — get routed into the tunnel it is trying to build.
+- **The segment it serves is usually the segment you manage the router from.** A
+  routing mistake inside the container can therefore cost you access to the device
+  you are deploying to. Observed: management access to a router was lost from the
+  LAN while a full-tunnel container sat on that same LAN.
+
+So before deploying anything that installs a default route or a broad policy rule,
+**establish an out-of-band path to the router** (NCM remote console, a second
+interface, serial) so a mistake is recoverable. And when reachability drops, test a
+second target on the same subnet before concluding the router is down — that
+distinguishes "router down" from "my path to it is down" in one command.
+
+Where a rule's correctness depends on a topology assumption like this, state the
+assumption in a comment next to the rule, and prefer checking it at startup: a
+container can compare its own address against the subnets it was told to serve and
+refuse, or warn loudly, when they overlap.
+
+### Put a Safety Invariant Above the Branch, Not Inside Each One
+
+When a container selects between implementations at runtime (a kernel path versus
+a userspace path, say), any safety rule that both paths need belongs in code that
+runs **before or regardless of** the selection — not duplicated into each branch.
+
+Duplicated safety logic drifts, and it drifts in the branch you cannot test. See
+"Verifying a Capability-Selected Branch" under Verifying Before Deployment: the
+development machine's own capabilities decide which branch runs locally, so one
+branch is typically never executed anywhere before deployment. Hoisting the rule
+makes the untested branch inherit it instead of needing its own correct copy.
+
 ### Routing LAN Traffic Through a Container
 
 A container that forwards, proxies or tunnels on behalf of LAN hosts needs those
@@ -647,6 +729,97 @@ observed state on an interval and re-establishes, plus exiting non-zero when the
 main process dies so the restart policy (which *is* documented) can act. Keep the
 health check as well, for visibility, but do not let it be the only thing standing
 between a dead session and an outage.
+
+### Logging State From a Supervisor Loop
+
+A container that maintains a session is usually the only thing that knows whether
+that session is up, so its log is the status view. Two rules keep that log useful
+rather than a wall of text, and they pull in opposite directions:
+
+- **Log transitions, not samples.** Up-to-down and down-to-up are the lines an
+  operator correlates against an event elsewhere. Restating an unchanged state on
+  every check buries them. Track the previous state and emit only on change.
+- **But add a sparse heartbeat anyway.** A pure transition log is
+  indistinguishable from a wedged supervisor — silence means "nothing changed" and
+  "the loop died" equally. A line every few minutes restating the current state
+  separates them, and it costs almost nothing. Make the interval configurable and
+  allow disabling it.
+
+**Throttle repeated recovery attempts.** A watchdog that retries a permanently
+unreachable dependency will otherwise emit its narration on every cycle forever,
+into a log shared with the rest of the router. Log the first attempt and then
+every Nth, and say in the line that it is throttled, so a reader does not mistake
+the gaps for the retries having stopped. `cp.py` does the same thing internally
+for repeated transport failures — this is that pattern applied to application
+logging.
+
+Where the container prints a status line derived from another program's output,
+**echo that program's lines rather than extracting columns from them**, unless you
+have actually observed the format. A wrong field pattern prints nothing while the
+check still looks like it ran, which is a silently empty status report — the worst
+kind, because it reads as "nothing to report".
+
+### Verifying a Capability-Selected Branch
+
+A container that picks between implementations based on what the platform offers
+has a verification problem that ordinary branch coverage language understates:
+**the development machine's capabilities decide which branch runs, deterministically
+and always the same way.** So the other branch is not merely under-tested, it is
+never executed — not locally, and not on the router either if the router happens to
+select the same one.
+
+This was observed costing a real defect. A safety rule was present in the branch
+the development kernel selected and **absent from the other**, because the local
+kernel lacked the feature the second branch needs, so that code had never run
+anywhere. The failure mode the rule existed to prevent was already documented in
+this repo, and the sample still shipped with it in one path.
+
+Three things to do about it:
+
+1. **Hoist shared safety rules above the branch** so the untested path inherits
+   them rather than needing its own copy (see "Put a Safety Invariant Above the
+   Branch").
+2. **Provide an override that forces each branch** — an environment variable, not
+   an auto-probe — and record which branch each verification run actually
+   exercised. `auto` selection during testing means not knowing what you tested.
+3. **Diff the branches line by line** for the ones you genuinely cannot execute
+   locally, treating any rule present in one and missing in the other as a defect
+   until proven otherwise. A comment claiming the branches are equivalent is not
+   evidence; the earlier note that "these rules are identical for both data paths"
+   sat directly above code where they were not.
+
+Log which branch was selected, unconditionally and early. That line is the only
+thing that tells you which code is running on a device you cannot introspect — and
+it needs to survive the log buffer, which a verbose dependency will not let it do
+(see "Reading a Container's Log").
+
+### Inducing States You Cannot Reach, by Shadowing the Status Command
+
+Verifying transition logic needs the transitions to happen, and the interesting
+one is usually unreachable locally because the peer does not exist. Standing up an
+open-source implementation of the peer (above) is the thorough option; when the
+only thing under test is your own state machine, shadowing the command your loop
+*asks* about state is much cheaper:
+
+```sh
+# In a throwaway wrapper entrypoint, ahead of the real binary on PATH.
+mkdir -p /usr/local/sbin
+cat > /usr/local/sbin/<tool> <<'STUB'
+#!/bin/sh
+case "$1" in
+  --status) [ elapsed -lt N ] && echo "down" || echo "up: <realistic line>" ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x /usr/local/sbin/<tool>
+exec /entrypoint.sh
+```
+
+This exercises transition detection, once-per-change behaviour, and any guard that
+runs only in the reached state — including whether it trips `set -e` when the data
+it wants is absent. **Be explicit about what it does not show:** the stub's output
+is your own invention, so it verifies control flow and proves nothing about the
+real tool's format. Keep the wrapper outside the repo and delete it afterwards.
 
 ### Enumerate a Daemon's Recovery Triggers, Do Not Assume It Reconnects
 
@@ -958,6 +1131,17 @@ Two habits for writing the result up:
   structurally visible rather than hiding it inside a quantifier. Watch for
   "always", "never" and "none of" in a write-up of a specific observation: those
   are the point where a claim about one endpoint became a claim about the daemon.
+- **State the consequence, not only the mechanism.** A permissive default or
+  fallback described accurately can still tell the reader nothing about their
+  exposure: "falls back to the system trust store" is mechanism, while "any of
+  ~150 independent third parties can satisfy this check, and revocation is not
+  verified because no fetcher is installed" is consequence. This is a defect class
+  of its own, and harder to catch than a wrong claim — nothing in the sentence is
+  false, so a review finds nothing to correct. The fix is adding the consequence,
+  not amending the wording. For any security-relevant fallback, say what an
+  attacker would need to be or to have for it to be exploited, and check the
+  neighbouring components that would otherwise mitigate it are actually present in
+  the image.
 
 ### Verify a Modular Daemon's Loaded Modules, Not Its Files
 
@@ -980,6 +1164,45 @@ is broken. Shell quoting in test payloads and hand-computed expected values are
 both easy to get wrong, and a false negative sends you looking for a bug that
 does not exist.
 
+**Give any "is this present?" enumeration a positive control**, because an empty
+result cannot distinguish a missing feature from a wrong query. A plugin directory
+glob guessed from another distribution's layout prints nothing, which reads
+exactly like "none of these modules exist" — observed directly: a glob that does
+not exist on the base image at all reported five modules absent when three were
+present a few directories away. Either include a token in the same command that
+must match, or resolve the location first rather than guessing it:
+
+```bash
+# Resolve where the files actually are, then enumerate.
+dpkg -L <package> | grep -m1 plugins
+find / -name '<a-file-you-know-exists>' 2>/dev/null
+```
+
+Keep each lookup on its own labelled line. A command that checks two paths at
+once can have one succeed and the other silently misfire, and a partial result is
+more convincing than an empty one — so it is likelier to be believed.
+
+**The daemon's own client CLI is not a clean data source either.** Its stdout is
+frequently prefixed with the same `failed to load` diagnostics the daemon emits at
+startup — observed: roughly thirty such lines ahead of the actual records — so a
+`wc -l` or an unanchored `grep -c` over it sums two unrelated things. Work in this
+order rather than guessing the format:
+
+```bash
+# 1. Strip the diagnostics and read ONE record verbatim. Do not assume field
+#    labels, leading whitespace, or that a --type/--filter flag exists.
+<client> --list-<things> 2>/dev/null | grep -v 'failed to load' | head -12
+
+# 2. Build the pattern from what step 1 actually printed, then count.
+```
+
+Then **derive the number a second way with a different tool** and check the two
+agree — count the files on disk, or parse them with an unrelated utility, and
+compare against what the daemon reports having ingested. A single count is one
+grep against a format you may have misread; two that agree is evidence. This
+matters most when the number backs a security claim, where a wrong pattern
+returning `0` or a partial match looks like a finding rather than a mistake.
+
 ## Security Considerations
 
 - Containers run in a protected namespace with user namespace remapping
@@ -987,21 +1210,39 @@ does not exist.
 - File ownership changes to `nobody:nobody` when replacing base image files (use copy-then-move workaround)
 - Config Store access must be explicitly enabled per container
 
-### Linux Capabilities (UNVERIFIED)
+### Linux Capabilities — Partly Confirmed
 
-Beyond "no root access to NetCloud OS," this repo has no confirmed statement of
-which Linux capabilities a container actually receives — in particular whether
-`CAP_NET_RAW` (raw sockets, needed for tools like `ping`'s raw-socket mode,
-packet crafting with `trafgen`/`mausezahn`, or `tcpreplay`) or `CAP_NET_ADMIN`
-(creating interfaces, adding addresses, routes and NAT rules inside the
-container's own network namespace) is granted, dropped, or configurable via
-Compose `cap_add`/`cap_drop`, and whether a `devices:` mapping such as
-`/dev/net/tun` is honoured. Any design that depends on raw sockets or other
-non-default capabilities should treat this as an open question and verify with a
-small probe before committing to a tool that needs it, rather than assuming from
-a package's documentation that it will work unprivileged inside
-`cpdockerengine`. Each probe is one command, and they run through
-`container exec` in any container already deployed:
+**Observed on a router** (kernel `5.4.213-coconut+`, aarch64), from a container's
+own startup preflight with `cap_add: [NET_ADMIN]` and
+`devices: [/dev/net/tun:/dev/net/tun]` in its compose:
+
+| Probe | Result |
+|-------|--------|
+| `cap_add: NET_ADMIN` honoured (add/del an `ip rule`) | **ok** |
+| `devices:` mapping honoured (`/dev/net/tun` present) | **ok** |
+| Create a TUN device (`ip tuntap add`) | **ok** |
+| `iptables -t nat` chain create/delete | **ok, but only via the legacy backend** — see below |
+| `iptables -t filter` chain create/delete | **ok, legacy backend** |
+| `net.ipv4.ip_forward` | **`1`** |
+| `ip xfrm state` (XFRM subsystem reachable) | **ok** |
+| `ip link add type xfrm` (XFRM *interface* support) | **absent** — `Error: Unknown device type` |
+
+So `cap_add`, `devices:` and netfilter rule installation all work, which several
+designs in this repo previously had to treat as open questions. Note what remains
+unconfirmed: **`CAP_NET_RAW`** (raw sockets, for `ping`'s raw mode, packet crafting,
+`tcpreplay`) was not probed, and neither was whether a compose `sysctls:` entry is
+honoured. Model and firmware were not captured alongside the kernel version, so
+treat this as "one router, one firmware" rather than fleet-wide and re-probe on the
+target device.
+
+The XFRM result matters beyond IPsec: **the XFRM subsystem being reachable does not
+mean XFRM interfaces exist.** Those are separate kernel options, and a design
+needing a routable tunnel interface from kernel IPsec has no path on this kernel —
+only the userspace/TUN alternative.
+
+Each probe is one command, and they run through `container exec` in any container
+already deployed — though see the caveats on `container exec` under Troubleshooting,
+and prefer putting them in the real container's preflight:
 
 ```sh
 python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_RAW, 1)'  # CAP_NET_RAW
@@ -1016,6 +1257,47 @@ The netfilter probes belong here rather than being assumed: **the availability o
 installed is capability policy.** Both fall in the "does not transfer" buckets
 above, so a NAT or firewall design that worked on a development machine has not
 been shown to work on the router — only that the rules and the logic are right.
+
+#### The nf_tables backend does not work; use legacy
+
+**This will break any container that runs `iptables` on these routers, silently and
+by default.** Observed on kernel `5.4.213-coconut+`: the **nf_tables** backend has
+no usable `nat` table, while the **legacy** `ip_tables` backend works fine.
+
+```
+netfilter backend iptables-nft: no usable nat table, trying the next
+netfilter backend: iptables-legacy (iptables v1.8.9 (legacy))
+PREFLIGHT ok : netfilter nat table writable (iptables-legacy)
+```
+
+Modern distributions ship `iptables` as a symlink to the **nft** implementation —
+Debian 12 and current Alpine both do — so a container that simply calls `iptables`
+gets the backend that does not work here. The binary runs, the syntax is accepted,
+and the rule insertion fails.
+
+Two ways to handle it, and the first is better because it degrades on a future
+kernel that gains nft support:
+
+```sh
+# Probe both and use whichever has a working nat table.
+for candidate in iptables-nft iptables-legacy; do
+    if "$candidate" -t nat -N probe 2>/dev/null; then
+        "$candidate" -t nat -X probe 2>/dev/null || true
+        IPT="$candidate"; break
+    fi
+done
+[ -n "${IPT:-}" ] || { echo "no usable netfilter backend" >&2; exit 1; }
+
+# Or pin it, if you accept re-checking when the firmware kernel changes.
+IPT=iptables-legacy
+```
+
+Then call `"$IPT"` everywhere rather than bare `iptables`, and **log which backend
+was selected** — otherwise a future kernel change silently moves you to the other
+one with no record. Note that `ip6tables` has the same split, and that the two
+backends do not see each other's rules, so mixing them within one container
+produces a ruleset that looks half-applied.
+
 The probes need `iptables` in the image, so they need a purpose-built probe
 container rather than an existing deployment.
 
@@ -1039,6 +1321,45 @@ the checks keep earning their place afterwards, because the same output
 distinguishes "the engine stopped granting this after a firmware upgrade" from an
 application fault. A separate probe container is still the right tool when the
 answer decides whether to write the real container at all.
+
+Two defects will silently destroy most of that value, and both were observed in a
+sample that looked correct until a real router failed a check:
+
+**`set -e` aborts the preflight at the first failure.** A helper that ends in
+`return 1` on failure, called as a bare top-level command, is a non-zero command
+under `set -e` — so the script exits immediately. Every later check goes
+unreported, the summary that explains what to do never prints, and the operator
+sees exactly one failure from a preflight built to report all of them in one
+deployment. Have the helper record the failure and **return 0**, then decide at the
+end:
+
+```sh
+preflight_failed=0
+check() {
+    label="$1"; shift
+    if "$@" >/dev/null 2>"$err"; then
+        log "PREFLIGHT ok      : ${label}"; return 0
+    fi
+    log "PREFLIGHT FAILED  : ${label}"
+    preflight_failed=1
+    return 0          # NOT 1 -- `set -e` would exit here and skip every later check
+}
+```
+
+Note the asymmetry: a helper whose result is consumed (`if probe ...; then`) is
+safe returning non-zero, because a command inside `if` does not trip `set -e`. So
+the same file can legitimately have one helper that returns a status and one that
+must not, and the difference is how each is *called*. Check the call sites, not
+just the definitions.
+
+**Discarding stderr reports a verdict without a reason.** `>/dev/null 2>&1` on the
+probed command reduces the answer to "it failed", when the command's own message is
+the discriminator — `Operation not permitted` means capability policy,
+`table does not exist` means the kernel or a wrong userspace backend,
+`No such file or directory` means a missing device or path. Those are three
+different fixes. Capture stderr and log the first line or two under the verdict.
+Without it, the deployment that was supposed to answer the platform question
+answers only half of it, and the remaining half needs another round trip.
 
 Order matters when a container installs the rules that enforce its own safety
 property: install them **before** starting the process whose traffic they govern,
@@ -1072,9 +1393,13 @@ forwarding design. Model and firmware were not captured with the result, so trea
 it as "seen on at least one production router" rather than a guarantee across the
 fleet, and re-read it on the target device; it is one command.
 
-Note what this does *not* establish. Forwarding being permitted by the kernel for
-that namespace says nothing about whether `cap_add` and `devices:` are honoured,
-or whether netfilter rules can be installed — those need their own probes, above.
+Note what this reading does *not* establish on its own. Forwarding being permitted
+by the kernel for that namespace says nothing about whether `cap_add` and
+`devices:` are honoured, or whether netfilter rules can be installed — each needs
+its own probe. Those probes have since been run, and all three came back **ok**;
+see the capability table above. Kept as a separate point because they are decided
+by different mechanisms (kernel permission for this one, engine and namespace
+policy for the others), so a future firmware could change one without the other.
 
 The general shape applies to any kernel state a container cannot modify: the
 question is not "how do we set this" but "what is it already, and is that
@@ -1140,11 +1465,142 @@ chasing the message.
 ### CLI Commands
 
 ```bash
-container list                          # List all containers
-container logs <container_name>         # View logs
-container exec <container_name> sh      # Shell into container
+container list                          # Projects and their containers
+container logs <container_name>         # Often EMPTY -- see below
+container exec <container_name> <cmd>   # No pipelines; returns NO output unless run on a TTY
+log show -i -s <container_name>         # Where the output actually is
 cat /status/container/<project>/info    # Container info
 ```
+
+### Reading a Container's Log
+
+**`container logs` frequently returns nothing, and that is not a fault.** Because
+the engine attaches the syslog driver rather than `json-file` (see the compose
+`logging` note above), a container's stdout and stderr go to the **router log**,
+tagged with the container name. Read them with the `log` CLI:
+
+```bash
+log show -i -s <container_name>     # -i case-insensitive, -s search message text
+log show -i -s PREFLIGHT           # or search for your own marker
+log show -f 200                    # follow, with history
+```
+
+Two details observed on hardware that change how output should be written:
+
+- **stdout arrives as `INFO`, stderr as `ERR`.** A chatty third-party daemon that
+  logs to stderr therefore fills the router's *error* log, regardless of what the
+  daemon itself considers the severity. Send routine output to stdout.
+- **The buffer is shared with the whole router and rolls over fast.** A verbose
+  daemon evicted a container's own startup diagnostics within about three minutes
+  — the `PREFLIGHT` lines were gone before anyone read them. Treat a wrapped
+  daemon's log level as a resource decision: default it low, make it an
+  environment variable, and keep your own status lines sparse enough to survive
+  (see "Logging State From a Supervisor Loop").
+
+`container exec` has two limitations worth knowing before relying on it for
+probes:
+
+- **No shell pipelines.** `... | head` fails with `Invalid command: head` — the
+  CLI parses the arguments itself rather than handing them to a shell.
+- **Non-interactively it returns no output at all.** Not "sometimes": every
+  attempt over a non-interactive SSH invocation returned the trailing
+  `<name> exec done.` and nothing else — including `echo` used as a positive
+  control, and including a command that produced a full listing when the *same*
+  user ran it moments later in an interactive session on the router console. A
+  TTY appears to be required. Treat the empty result as expected, not as the
+  command having failed.
+
+Both matter because probing "does the engine grant X" is documented throughout
+this guide as a `container exec` one-liner. **From a script or an SSH one-liner,
+that pattern does not work** — put the probe in the container's own entrypoint and
+read the result with `log show`, which is the preflight pattern anyway, or run the
+exec by hand on the console when a one-off answer is needed.
+
+**Scope this correctly when advising someone else.** The failing case is the
+*non-interactive* one, which is how the repo's own tooling drives the router. Run
+by hand at an interactive prompt on the router, `container exec` works normally —
+confirmed by a user pasting full output from a console session. Leading with the
+limitation as though it were unconditional invites the reader to conclude the
+advice is wrong, because the mode they are using is the mode that works. Name the
+invocation mode in the same breath as the limitation.
+
+### Diagnosing a Deployed Container That Carries Traffic
+
+When a forwarding, proxying or tunnelling container is up but traffic is not
+working, counters localise the fault far faster than reading configuration. Three
+places have them, and reading them in this order narrows the problem by roughly
+half each time.
+
+**1. The container's own directional counters.** Whatever the container's payload
+protocol is, find its per-connection or per-association byte and packet counts. The
+*direction* is the diagnosis:
+
+| Outbound | Inbound | Means |
+|----------|---------|-------|
+| 0 | 0 | Traffic never reached the container, or never got routed into the path. Look at the router and at the container's routing table |
+| >0 | 0 | The container is doing its job and the far end is not answering. Stop looking at your own configuration |
+| >0 | >0 | Both directions transit; the loss is on the return leg *inside* the container — usually a routing or NAT rule sending replies the wrong way |
+
+The `>0 / 0` case is worth calling out because it **exonerates your side across an
+administrative boundary you cannot instrument.** When the far end belongs to someone
+else, this is the substitute for asserting at the real endpoint, and it is enough to
+move the conversation to them with evidence rather than a guess.
+
+**2. Divide bytes by packets.** The mean packet size identifies *what* the counter
+counted, which a raw total cannot. 1092 bytes over 13 packets is exactly 84 bytes
+each, which is `ping`'s default (56 data + 8 ICMP + 20 IP) — so those packets are
+attributable to a specific test rather than to background chatter. This is the
+cheapest way to confirm a counter reflects your traffic and not something else, and
+it costs one division.
+
+**3. Netfilter and interface counters.** `iptables-legacy -vnL FORWARD` prints the
+chain's *policy* counter in its header (`Chain FORWARD (policy DROP N packets...)`),
+which is how a fail-closed drop becomes visible instead of silent. `-t nat -vnL
+POSTROUTING` shows whether a translation rule fired, and `ip -s link show <dev>`
+gives per-interface totals. Use the right backend — `iptables-nft` and
+`iptables-legacy` cannot see each other's rules.
+
+**4. Simulate the routing decision instead of inferring it.** `ip route get
+<dst> from <src> iif <in-dev>` asks the kernel what it would actually do with a
+forwarded packet, in either direction. Run it for the return path too; that is the
+direction a catch-all rule silently captures.
+
+**5. Router-side, over REST.** `status/firewall` → `conntrack[]` carries
+`orig_packets`/`orig_bytes` and `reply_packets`/`reply_bytes` per entry, so the
+router will tell you whether it forwarded the request and whether anything came
+back. `status/routing` confirms a static route or policy actually installed
+(`cli.route` and `cli.rtpolicy_v4` give raw CLI output). For packet-level truth
+there is a tcpdump API — see [ncos-api/control/tcpdump.md](ncos-api/control/tcpdump.md).
+These field lists are from this repo's API documentation rather than from a run.
+
+Reset counters between attempts (`iptables-legacy -Z`) or record before and after
+and reason about the delta. An absolute count says nothing about which attempt
+produced it — and when the evidence is handed to a user, they will read a leftover
+count as current.
+
+#### A Narrow Local Traffic Selector Makes the Counter Prove the NAT
+
+Where a container translates LAN traffic into a tunnel and the negotiated *local*
+selector is a single assigned address, the outbound counter incrementing at all is
+itself proof that source translation happened: untranslated packets would not have
+matched the selector and would never have been counted. That turns one command into
+two facts. Read the same relationship in reverse when the counter is zero while
+packets are known to reach the container — suspect the translation rule before the
+routing.
+
+#### Choose a Canary Destination the Far End Is Meant to Permit
+
+Testing egress through a third-party managed gateway with `ping` to a public DNS
+resolver is close to the worst available test, and it is the one everybody reaches
+for first. A filtering or security service commonly drops ICMP to arbitrary hosts as
+ordinary policy, and commonly blocks public resolvers specifically to stop clients
+bypassing its own DNS. A failure therefore proves nothing about the tunnel.
+
+Pick a destination the service is *supposed* to allow, and exercise **TCP** — which
+this guide already recommends for MTU and connection-tracking reasons, and which
+here also avoids being denied by policy before it can tell you anything. Where the
+gateway pushes its own resolvers, read them from the container (`/etc/resolv.conf`
+once the tunnel is up) and test against those.
 
 ### Common Issues
 

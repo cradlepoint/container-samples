@@ -99,11 +99,22 @@ Returns empty output if no containers are running.
 
 ### container logs CONTAINER_NAME
 
-View logs for a running container. Requires `logging: {driver: json-file}` in the compose YAML.
+View logs for a running container. **Commonly returns nothing, and that is not a
+fault.** Observed on a router: the engine attaches the **syslog** driver with
+`tag: {{.Name}}` and an empty `LogPath`, ignoring a compose
+`logging: {driver: json-file}` request, so stdout and stderr go to the **router
+log** instead. Adding a `logging:` block does not change this — it only implies a
+driver you will not get.
 
 ```
-container logs ntopng_ntopng_1
+container logs ntopng_ntopng_1        # often empty
+log show -i -s ntopng_ntopng_1        # where the output actually is
 ```
+
+See "Reading a Container's Log" in
+[container-development-guide.md](../../container-development-guide.md) for the
+`log` CLI, and for the `container exec` limitations (no shell pipelines, and no
+output at all without a TTY).
 
 Note: Container names follow the pattern `{project}_{service}_{instance}`.
 
@@ -244,12 +255,14 @@ volumes:
 ```
 
 ### Logging
-```yaml
-services:
-  myservice:
-    logging:
-      driver: json-file           # Required for "container logs" to work
-```
+
+**Omit the `logging:` block for an NCOS deployment.** The engine configures the
+syslog driver regardless, so requesting `json-file` has no effect other than
+implying a driver you will not get — see the `container logs` note above. Read
+container output with `log show -i -s <container_name>`.
+
+A `json-file` block is still useful in a *local* development compose file, where
+it does work.
 
 ---
 
@@ -298,7 +311,7 @@ docker buildx build --platform linux/arm64 \
 Then deploy:
 ```bash
 curl -s -k -u admin:pass -X POST "https://ROUTER_IP/api/config/container/projects/" \
-  -d 'data={"name":"ntopng","config":"version: \"2.4\"\nservices:\n  ntopng:\n    image: yourusername/ntopng:arm64\n    restart: unless-stopped\n    mem_limit: 512m\n    ports:\n      - \"3000:3000\"\n    volumes:\n      - ntopng-data:/var/lib/ntopng\n    logging:\n      driver: json-file\nvolumes:\n  ntopng-data:\n    driver: local","enabled":true,"update_interval":0}'
+  -d 'data={"name":"ntopng","config":"version: \"2.4\"\nservices:\n  ntopng:\n    image: yourusername/ntopng:arm64\n    restart: unless-stopped\n    mem_limit: 512m\n    ports:\n      - \"3000:3000\"\n    volumes:\n      - ntopng-data:/var/lib/ntopng\nvolumes:\n  ntopng-data:\n    driver: local","enabled":true,"update_interval":0}'
 ```
 
 ---

@@ -24,6 +24,9 @@ NAT and MSS rules are identical either way.
 - **Self-preflighting.** On startup it checks each platform grant it depends on
   and refuses to run with a partial data path. Read those lines first when
   something is wrong.
+- **Observable from the log.** There is no web UI and no published port. Every
+  state change is logged when it happens, with a periodic line restating an
+  unchanged state, so `container logs ipsec_client` is the status view.
 
 ## Files
 
@@ -68,32 +71,31 @@ starting in a half-configured state.
 | `VPN_MSS_CLAMP` | no | `1` | Clamp TCP MSS to path MTU on the tunnel |
 | `VPN_FAIL_CLOSED` | no | `1` | Drop forwarded traffic when the tunnel is down |
 | `VPN_WATCHDOG_INTERVAL` | no | `20` | Seconds between SA checks |
+| `VPN_STATUS_INTERVAL` | no | `300` | Seconds between periodic status lines. `0` logs transitions only |
 
 `VPN_PSK` and `VPN_PASSWORD` are never logged, and the generated `swanctl.conf` is
 written mode 600. They are still visible to anyone with NCM access to the device's
 configuration, which is the normal trade for NCOS-managed containers.
 
-### Mapping a FortiGate dialup profile onto these settings
+### Matching the gateway
 
-| FortiGate phase 1 / phase 2 | Container setting |
-|-----------------------------|-------------------|
-| `ike-version: 2` | fixed, IKEv2 only |
-| `authmethod: signature` + `certificate: <name>` | `VPN_GATEWAY_AUTH=pubkey`, plus `VPN_CA_CERT_B64` for the issuing CA |
-| `authmethod: psk` with a `psksecret` | `VPN_GATEWAY_AUTH=psk`, `VPN_PSK=...` |
-| `eap: enable`, `authusrgrp: <group>` | `VPN_USERNAME` / `VPN_PASSWORD`, `VPN_EAP_METHOD` |
-| `proposal: aes256-sha256` + `dhgrp: 14` | `VPN_IKE_PROPOSALS=aes256-sha256-modp2048` |
-| phase 2 `proposal: aes256-sha256` + `pfs: disable` | `VPN_ESP_PROPOSALS=aes256-sha256` (no DH group) |
-| `mode-cfg: enable`, `assign-ip: enable` | automatic — the container requests a virtual IP and installs it |
-| phase 2 `src-subnet`/`dst-subnet` `0.0.0.0 0.0.0.0` | `VPN_REMOTE_TS=0.0.0.0/0` (full tunnel) |
-| `nattraversal: enable` | automatic — NAT-T is detected and ESP is UDP-encapsulated |
-| `ipv4-dns-server1/2` pushed by mode-cfg | arrive in the *container*, not on your clients — see the DNS step below |
-| `dpd: on-idle`, `dpd-retryinterval` | `VPN_DPD_DELAY` |
+The proposals, EAP method and traffic selector have to match what the gateway is
+configured for. Get the gateway's own configuration rather than working from
+assumptions, and if a client that already connects to it exists — a phone profile,
+another vendor's client — read that too: it is a specification that has already
+been proven against the live gateway.
 
-The gateway's own identity is worth checking rather than assuming: it is normally
-the FQDN in its certificate, which is the value a working mobile profile puts in
-`RemoteIdentifier`. If the gateway also sets a `localid`, it may send that
-instead. On a mismatch, charon logs the identity it actually received, so set
-`VPN_GATEWAY_ID` to whatever appears there.
+Three things are negotiated automatically and have no setting: the container
+requests a virtual IP and installs it, NAT-T is detected and ESP is
+UDP-encapsulated, and IKEv2 is the only version offered.
+
+The gateway's identity is worth checking rather than assuming: it is normally the
+FQDN in its certificate, but a gateway configured with an explicit local
+identity may send that instead. On a mismatch, charon logs the identity it
+actually received, so set `VPN_GATEWAY_ID` to whatever appears there.
+
+DNS servers the gateway pushes arrive in the *container*, not on your clients —
+see the DNS step under deployment.
 
 ## Building
 
@@ -110,9 +112,17 @@ docker buildx build --platform linux/arm64 -t yourregistry/ipsec_client:latest -
 docker buildx build --platform linux/arm/v7 -t yourregistry/ipsec_client:latest-armv7 --push .
 ```
 
-Measured image sizes: 130 MB (arm64), 70.8 MB (arm/v7). That is flash and pull
+Measured image sizes: 161 MB (arm64), 98.7 MB (arm/v7). That is flash and pull
 cost; resident memory with a tunnel established is single-digit megabytes, well
 under the `mem_limit: 128M` in the compose files.
+
+About 30 MB of that is `libcurl4` and its transitive closure (krb5/GSSAPI, LDAP,
+nghttp2, psl, rtmp, ssh2, brotli, zstd), pulled in because the CRL/OCSP fetcher
+plugin needs it. It buys working revocation checking. If flash or pull time over a
+metered WAN matters more than revocation for your deployment, dropping
+`libstrongswan-extra-plugins` from the Dockerfile reverts to roughly 130 MB and
+70 MB — at the cost of `no capable fetcher found` and revocation never being
+verified.
 
 ## Deploying on NCOS
 
@@ -177,7 +187,7 @@ under the `mem_limit: 128M` in the compose files.
    Internal names will not resolve and query metadata leaves outside the tunnel.
    The servers the gateway pushes via mode-config arrive in the *container*, not
    on your clients, so set DHCP option 6 (`config/lan/dhcpd/options`) to whatever
-   the gateway pushes — read it from the gateway's `ipv4-dns-server1`/`2`, or from
+   the gateway pushes — read it from the gateway's own configuration, or from
    `/etc/resolv.conf` inside the container once the tunnel is up.
 
 5. **Read the log before anything else.**
@@ -188,6 +198,77 @@ under the `mem_limit: 128M` in the compose files.
 
    The `PREFLIGHT` lines confirm or deny each platform grant, and the
    authentication lines show which round succeeded.
+
+## Status and logging
+
+Everything goes to stdout and stderr, which the container runtime collects via the
+`json-file` driver. Lines are printed bare — no timestamp and no source prefix —
+because the driver already records a timestamp per line and the log is per
+container, so repeating either in the message only makes it harder to read.
+
+Retrieve it with `container logs ipsec_client`. The lines also surface in a
+router-side log view, where the carrier prefixes each one with a timestamp, a
+level and the container name — which is why the messages here are bare:
+
+```
+07:37:10 AM INFO ipsec_client SELECTED data path: userspace (interface ipsec0)
+```
+
+There is no web interface and no published port. `container logs ipsec_client` is
+the status view, and `container exec ipsec_client swanctl --list-sas` gives live
+detail on demand.
+
+What gets logged, and when:
+
+| Line | When |
+|------|------|
+| Configuration summary, `PREFLIGHT ...`, `SELECTED data path` | Once at startup |
+| `FORWARD policy DROP`, `route:`, `policy route:` | Once, as the data plane is installed |
+| `tunnel UP: ...` followed by the SA detail and the assigned address | On each transition to established |
+| `tunnel DOWN: ...` | On each transition away from established, naming the fail-closed state |
+| `watchdog: ... re-initiating (attempt N)` | First attempt, then every tenth |
+| `status: tunnel up\|down, ...` | Every `VPN_STATUS_INTERVAL` seconds |
+| `ERROR: charon exited` | Immediately before exiting non-zero so the restart policy fires |
+
+Two deliberate choices worth knowing:
+
+- **Transitions are logged once, not repeated.** A tunnel that stays up produces
+  one `tunnel UP` line and then only the periodic `status:` heartbeat. The
+  heartbeat exists so a healthy tunnel still proves the watchdog is running;
+  set `VPN_STATUS_INTERVAL=0` to log transitions only.
+- **Repeated recovery attempts are throttled.** An unreachable gateway would
+  otherwise emit a pair of lines every `VPN_WATCHDOG_INTERVAL` forever, into a
+  log shared with the rest of the router. The first attempt and every tenth are
+  logged, and the line says so.
+
+Expect one `loaded certificate` line per trust anchor at startup — that is the
+trust store being read, not an error. With the system CA bundle fallback it is
+around 150 lines.
+
+There should be **no** `plugin '<name>': failed to load` lines. If any appear,
+read them rather than dismissing them as noise: that block is where a plugin your
+configuration actually needs would hide, and its failure surfaces much later as an
+authentication or crypto error. To decide whether a given one matters, check it
+against what the tunnel actually negotiated (`swanctl --list-sas` names the IKE and
+ESP algorithms) and against the plugins this container depends on: `openssl`,
+`x509`, `revocation`, `curl`, `eap-mschapv2`, and `kernel-libipsec` or
+`kernel-netlink` for the selected data path. Confirm what is genuinely loaded with:
+
+```bash
+container exec ipsec_client swanctl --stats
+```
+
+File presence is a different and weaker test — a plugin can exist on disk, be
+configured to load, and silently not load on an unmet dependency.
+
+Certificate revocation is checked when the gateway authenticates with a
+certificate: the `curl` fetcher is installed, so charon retrieves CRLs and OCSP
+responses. Enforcement is strongSwan's default `relaxed`, which rejects a
+certificate only when it is *known* revoked — an unreachable responder logs a
+warning and establishment continues. Those fetches leave via the container's WAN
+route before the tunnel exists, so they are outbound traffic on a possibly metered
+link. See the Dockerfile comment for `ifuri` and `strict` if your policy requires
+revocation status to be available rather than merely consulted.
 
 ## Troubleshooting
 

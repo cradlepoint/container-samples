@@ -87,9 +87,39 @@ cp.post('config/wan/rules2/', new_rule)
 cp.log(f'WAN is {state}')
 ```
 
+### Where log output actually goes
+
+`log()` writes to stdout, which the container runtime collects. Where it goes from
+there is not where the Docker-shaped guess would put it.
+
+**Container output goes to the router log, via the syslog driver.** Confirmed on a
+router: the engine attaches `LogConfig.Type: syslog` with `tag: {{.Name}}` and an
+empty `LogPath`, so `container logs <name>` returns nothing and the lines appear in
+the router log instead, read with `log show -i -s <container_name>`:
+
+```
+07:37:10 AM INFO ipsec_client <the message>
+```
+
+The carrier supplies the **timestamp, the level, and the container name**, so the
+application should not add any of them. **stdout becomes `INFO` and stderr becomes
+`ERR`** — worth knowing, because routine output written to stderr lands in the
+router's error log at ERR severity.
+
+Two caveats on this observation. Model and firmware were not captured, so treat it
+as "seen on at least one router" rather than fleet-wide. And these lines were found
+by the `log` CLI; a `status/log` read filtered on the container name returned only
+engine API chatter, so whether the same lines are retrievable through
+`status/log` over REST is **not** established — if you need programmatic access
+rather than a human reading `log show`, verify that separately.
+
+`alert()` remains the only channel *confirmed end to end* to the NCM console as a
+structured, filterable event; the log is prose.
+
 ### Log Prefix and APP_NAME
 
-`log()` prefixes every line with `APP_NAME`, which is resolved once at import:
+`log()` prefixes every line with a timestamp **and** `APP_NAME`, which is resolved
+once at import:
 
 ```python
 APP_NAME = os.environ.get('CP_APP_NAME') or os.path.basename(os.getcwd()) or 'container'
@@ -102,6 +132,24 @@ the same place. **Set it explicitly in the Dockerfile:**
 ```dockerfile
 ENV CP_APP_NAME=my_service
 ```
+
+Note that the log carrier stamps lines too. On the router the carrier is the
+**syslog** driver, and the router log view prefixes each line with a timestamp, a
+severity and the container name:
+
+```
+07:37:10 AM INFO my_service SELECTED data path: userspace
+```
+
+(Locally, where a `json-file` driver does apply, it records a timestamp per entry
+and the log is already per container.) Either way `log()`'s own
+timestamp and name are **duplicates** of metadata the carrier holds, which is
+harmless in a Python application reading its own output but worth knowing when
+you control the format. A shell entrypoint writing directly to stdout should
+generally print the bare message rather than reimplementing this prefix — the
+carrier's copy is not lost, and one timestamp per line reads better than two.
+`APP_NAME` still earns its keep independently: it is the `name` field `alert()`
+sends, and it distinguishes sources when several services write to one place.
 
 This matters beyond cosmetics wherever `APP_NAME` is used as protocol data rather
 than just a prefix, because the payload would otherwise depend on the working
