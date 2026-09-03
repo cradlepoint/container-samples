@@ -1,11 +1,42 @@
 ---
-inclusion: auto
-description: General lessons learned from building containers for Cradlepoint NCOS routers
+inclusion: manual
+description: Closed archive of dated reflection entries from past container builds (2026-08-14 to 2026-09-02). Not appended to. Load with #lessons-learned when the history or evidence behind a fact is needed; current platform facts live in container-platform-limits.md
 ---
 
-# Lessons Learned
+# Lessons Learned (closed archive)
 
-This file captures general lessons learned from building containers for Cradlepoint NCOS routers. It is updated after each container build via the reflection hook. Only general-purpose improvements are recorded here, not project-specific details.
+**This file is a closed archive. Nothing is appended to it.** It holds the dated
+reflection entries written between 2026-08-14 and 2026-09-02, kept in full because
+a future reader needs to know which advice was tried and failed, and what evidence
+each conclusion rested on. Entries are preserved exactly as written, including the
+struck-through lines and the corrections that superseded them.
+
+It loads **manually only** (`#lessons-learned` in chat), because at ~257 KB it was
+consuming most of a session's context before any code was read.
+
+Where to go instead:
+
+- **Current platform facts** — `.kiro/steering/container-platform-limits.md`.
+  That file is authoritative and is where new facts get written, corrected in
+  place. Where it disagrees with an entry here, it wins.
+- **Workflow and conventions** — `.kiro/steering/container-building.md`.
+- **Detail and worked examples** — `docs/container-development-guide.md`,
+  `docs/cs-sock-protocol.md`, `docs/ncos-sdk-reference.md`,
+  `docs/memory-resources.md`.
+
+Two corrections worth carrying before reading any entry below, because the wrong
+versions appear here and were true at the time of writing:
+
+- The `alert` verb **does** work from a container — verified on an R980-5GD
+  running NCOS 7.26.21 from a container holding only the `$CONFIG_STORE` volume
+  with no SDK app registration. The claim at "Corrections to earlier entries in
+  this file" that `cp.alert()` requires the on-router SDK application context is
+  wrong; the 2026-08-15 entry "RESULT: the alert verb works from a container"
+  supersedes it. Whether an accepted alert reaches the NCM console is UNVERIFIED.
+- `cp.alert()` is no longer a stub, and the stub message this file records as an
+  outstanding fix has been removed from `cp.py`.
+
+Everything below is the archive as it stood.
 
 ## Initial Lessons
 

@@ -170,6 +170,7 @@ class CpTestCase(unittest.TestCase):
     def setUp(self):
         self._saved = {
             'SOCKET_PATH': cp.SOCKET_PATH,
+            'DOTENV_PATH': cp.DOTENV_PATH,
             '_RECV_TIMEOUT': cp._RECV_TIMEOUT,
             '_PROBE_COOLDOWN': cp._PROBE_COOLDOWN,
             '_MAX_RESPONSE_BYTES': cp._MAX_RESPONSE_BYTES,
@@ -927,7 +928,7 @@ class TestAlert(CpTestCase):
         store = self.serve(lambda command: framed('ok'))
         self.assertFalse(cp.alert(''))
         self.assertEqual(store.commands, [])
-        self.assertIn('Router NCOS App Generated Alert', self.logs)
+        self.assertIn('refusing to send an empty alert', self.logs)
 
     def test_newlines_are_collapsed_not_refused(self):
         """Unlike a path, alert text is prose: altering it is better than
@@ -1060,6 +1061,15 @@ class RestTestCase(CpTestCase):
         self.addCleanup(shutil.rmtree, directory, True)
         cp.SOCKET_PATH = os.path.join(directory, 'absent.sock')
 
+        # Credentials come from .env only. Point DOTENV_PATH at this temporary
+        # directory so the suite never reads the developer's real .env -- without
+        # this, these tests pass or fail depending on whose machine runs them.
+        self._dotenv = os.path.join(directory, '.env')
+        cp.DOTENV_PATH = self._dotenv
+
+        # Router credentials are no longer environment variables. Clear the names
+        # anyway, so a stale export in the shell running the suite cannot make a
+        # test that asserts they are ignored pass for the wrong reason.
         self._saved_env = {}
         for names in cp._REST_ENV_NAMES.values():
             for name in names:
@@ -1072,6 +1082,13 @@ class RestTestCase(CpTestCase):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+    def write_dotenv(self, **values):
+        """Write a .env for use_rest() to read. Keys are given without prefix."""
+        with open(self._dotenv, 'w', encoding='utf-8') as handle:
+            handle.write('# test fixture\n')
+            for key, value in values.items():
+                handle.write(f'NCOS_DEV_{key.upper()}={value}\n')
 
     def make_router(self, responder):
         router = MockRouter(responder)
@@ -1092,36 +1109,61 @@ class TestRestConfiguration(RestTestCase):
         with self.assertRaises(ValueError) as caught:
             cp.use_rest()
         message = str(caught.exception)
-        self.assertIn('CP_ROUTER_HOST', message)
-        self.assertIn('CP_ROUTER_PASSWORD', message)
+        self.assertIn('NCOS_DEV_HOST', message)
+        self.assertIn('NCOS_DEV_PASSWORD', message)
         self.assertEqual(cp.transport(), 'socket', 'must not switch on failure')
 
     def test_missing_password_alone_raises(self):
         with self.assertRaises(ValueError):
             cp.use_rest(host='192.168.0.1')
 
-    def test_reads_cp_router_env(self):
-        os.environ['CP_ROUTER_HOST'] = '10.0.0.1'
-        os.environ['CP_ROUTER_PASSWORD'] = 'pw'
+    def test_reads_dotenv(self):
+        self.write_dotenv(host='10.0.0.1', password='pw')
         target = cp.use_rest()
         self.assertEqual(target.host, '10.0.0.1')
         self.assertEqual(target.username, 'admin')
-        self.assertEqual(target.sources['host'], 'CP_ROUTER_HOST')
+        self.assertEqual(target.sources['host'], '.env:NCOS_DEV_HOST')
 
-    def test_reads_ncos_dev_env_so_an_exported_dotenv_works(self):
-        os.environ['NCOS_DEV_HOST'] = '10.0.0.2'
-        os.environ['NCOS_DEV_PASSWORD'] = 'pw'
-        os.environ['NCOS_DEV_USERNAME'] = 'operator'
+    def test_dotenv_supplies_every_field(self):
+        self.write_dotenv(host='10.0.0.2', password='pw', username='operator')
         target = cp.use_rest()
         self.assertEqual(target.host, '10.0.0.2')
         self.assertEqual(target.username, 'operator')
-        self.assertEqual(target.sources['host'], 'NCOS_DEV_HOST')
 
-    def test_cp_router_wins_over_ncos_dev(self):
-        os.environ['CP_ROUTER_HOST'] = 'preferred'
-        os.environ['NCOS_DEV_HOST'] = 'fallback'
-        os.environ['CP_ROUTER_PASSWORD'] = 'pw'
-        self.assertEqual(cp.use_rest().host, 'preferred')
+    def test_environment_variables_are_ignored_for_credentials(self):
+        """`.env` is the only source. A stale export must not aim this
+        anywhere, because a second source is exactly how a corrected address
+        became invisible."""
+        self.write_dotenv(host='10.0.0.5', password='pw')
+        os.environ['NCOS_DEV_HOST'] = '10.9.9.9'
+        os.environ['CP_ROUTER_HOST'] = '10.9.9.9'
+        self.assertEqual(cp.use_rest().host, '10.0.0.5')
+
+    def test_environment_alone_does_not_configure_rest(self):
+        os.environ['NCOS_DEV_HOST'] = '10.9.9.9'
+        os.environ['NCOS_DEV_PASSWORD'] = 'pw'
+        with self.assertRaises(ValueError):
+            cp.use_rest()
+
+    def test_explicit_arguments_win_over_dotenv(self):
+        self.write_dotenv(host='10.0.0.6', password='pw')
+        self.assertEqual(cp.use_rest(host='10.0.0.7', password='pw').host,
+                         '10.0.0.7')
+
+    def test_absent_dotenv_raises_rather_than_defaulting(self):
+        self.assertFalse(os.path.exists(self._dotenv))
+        with self.assertRaises(ValueError):
+            cp.use_rest()
+
+    def test_dotenv_comments_and_quotes(self):
+        with open(self._dotenv, 'w', encoding='utf-8') as handle:
+            handle.write('# a comment\n\n')
+            handle.write('NCOS_DEV_HOST="10.0.0.8"\n')
+            handle.write("NCOS_DEV_PASSWORD=pa#ss\n")
+        target = cp.use_rest()
+        self.assertEqual(target.host, '10.0.0.8')
+        self.assertEqual(target.password, 'pa#ss',
+                         "'#' is an ordinary password character mid-line")
 
     def test_scheme_pasted_into_host_is_tolerated(self):
         target = cp.use_rest(host='https://10.0.0.3/', password='pw')
@@ -1250,7 +1292,7 @@ class TestRestFailures(RestTestCase):
         self.assertIsNone(cp.get('status/product_info'))
         self.assertFalse(cp.config_store_status()['available'])
         self.assertIn('401 unauthorized', self.logs)
-        self.assertIn('CP_ROUTER_PASSWORD', self.logs)
+        self.assertIn('NCOS_DEV_PASSWORD', self.logs)
 
     def test_http_error_is_a_transport_failure(self):
         router = self.make_router(lambda request: (500, {'error': 'boom'}))
@@ -1340,21 +1382,21 @@ class TestRestRefusedOnTheRouter(RestTestCase):
         self.assertTrue(store.commands)
 
     def test_refusal_happens_before_any_credential_is_resolved(self):
-        """A refused call must not read, hold or report a password."""
+        """A refused call must not read, hold or report a password. The password
+        goes in .env, the real source, or this asserts nothing."""
         self._serve_socket()
-        os.environ['CP_ROUTER_PASSWORD'] = 'hunter2'
+        self.write_dotenv(host='10.0.0.9', password='hunter2')
         with self.assertRaises(RuntimeError) as caught:
             cp.use_rest(host='10.0.0.9')
         self.assertNotIn('hunter2', str(caught.exception))
         self.assertNotIn('hunter2', json.dumps(cp.config_store_status()))
         self.assertNotIn('hunter2', self.logs)
 
-    def test_refusal_does_not_depend_on_env_being_configured(self):
-        """The guard fires even when the target is fully configured, which is
-        exactly the case a compose `environment:` block would create."""
+    def test_refusal_does_not_depend_on_being_configured(self):
+        """The guard fires even when the target is fully configured. Configure it
+        through .env, so the refusal is what raises rather than a missing host."""
         self._serve_socket()
-        os.environ['CP_ROUTER_HOST'] = '10.0.0.9'
-        os.environ['CP_ROUTER_PASSWORD'] = 'pw'
+        self.write_dotenv(host='10.0.0.9', password='pw')
         with self.assertRaises(RuntimeError):
             cp.use_rest()
         self.assertEqual(cp.transport(), 'socket')
@@ -1375,8 +1417,7 @@ class TestRestRefusedOnTheRouter(RestTestCase):
         """`python3 cp.py --rest` on the router exits 2 with the explanation,
         rather than raising through to a traceback."""
         self._serve_socket()
-        os.environ['CP_ROUTER_HOST'] = '10.0.0.9'
-        os.environ['CP_ROUTER_PASSWORD'] = 'pw'
+        self.write_dotenv(host='10.0.0.9', password='pw')
         self.assertEqual(cp._main(['--rest']), 2)
         self.assertIn('refusing to enable the REST transport', self.logs)
         self.assertEqual(cp.transport(), 'socket')
@@ -1404,12 +1445,9 @@ class TestCli(CpTestCase):
         directory = tempfile.mkdtemp(prefix='cp-test-')
         self.addCleanup(shutil.rmtree, directory, True)
         cp.SOCKET_PATH = os.path.join(directory, 'absent.sock')
-        saved = {}
-        for names in cp._REST_ENV_NAMES.values():
-            for name in names:
-                saved[name] = os.environ.pop(name, None)
-        self.addCleanup(lambda: [os.environ.__setitem__(k, v)
-                                 for k, v in saved.items() if v is not None])
+        # Point .env at an absent path. Without this the test reads the real
+        # repo-root .env and passes or fails per developer machine.
+        cp.DOTENV_PATH = os.path.join(directory, 'absent.env')
         self.assertEqual(cp._main(['--rest']), 2)
         self.assertIn('not configured', self.logs)
 
@@ -1418,12 +1456,11 @@ class TestNoAutomaticFallback(RestTestCase):
     def test_a_missing_socket_never_silently_uses_rest(self):
         """The safety property that makes this transport acceptable to ship in
         container code: a container whose $CONFIG_STORE volume is missing must
-        fail visibly, not start reconfiguring whatever router a leftover
-        environment variable points at."""
+        fail visibly, not start reconfiguring whatever router a leftover .env
+        points at. Fully configured on purpose — an unconfigured target would
+        pass this test without exercising the property."""
         router = self.make_router(lambda request: (200, {'success': True, 'data': 'X'}))
-        os.environ['CP_ROUTER_HOST'] = router.host
-        os.environ['CP_ROUTER_PASSWORD'] = 'secret'
-        os.environ['CP_ROUTER_SCHEME'] = 'http'
+        self.write_dotenv(host=router.host, password='secret', scheme='http')
 
         directory = tempfile.mkdtemp(prefix='cp-test-')
         self.addCleanup(shutil.rmtree, directory, True)

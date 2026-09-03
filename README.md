@@ -21,7 +21,7 @@ Kiro can clone the repo for you, no terminal needed:
 3. Pick a local folder to clone into.
 4. When prompted, choose **Open** to open the cloned repo as your Kiro workspace.
 
-Kiro picks up the steering files in `.kiro/steering/` automatically once the workspace is open, so it already knows the conventions, constraints, and reference samples in this repo.
+Kiro picks up the steering files in `.kiro/steering/` once the workspace is open, so it already knows the conventions, constraints, and reference samples in this repo. Two load automatically: `container-building.md` (the build workflow) and `container-platform-limits.md` (the platform facts — compose rules, networking, volumes, health checks, per-model memory, Config Store behaviour). `lessons-learned.md` is a closed archive of past reflection entries and loads only when you ask for it with `#lessons-learned`.
 
 ### 3. Chat with Kiro to build a container
 

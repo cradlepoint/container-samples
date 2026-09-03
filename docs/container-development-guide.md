@@ -478,17 +478,22 @@ needs none.
 
 | Capability | Status | What to do |
 |------------|--------|------------|
-| NCM custom alerts (`cp.alert()`) | **Works from a container.** Verified end-to-end: sent from a container, appeared in the NCM console as "Custom Alert" (R980, NCOS 7.26.21) | Use `cp.alert('text')` |
+| NCM custom alerts (`cp.alert()`) | **Works from a container at the socket level.** Verified: sent from a container holding only `$CONFIG_STORE`, no SDK app registration, and the Config Store replied `Alert added(...)` (R980-5GD, NCOS 7.26.21). Whether the alert reaches the NCM console is UNVERIFIED | Use `cp.alert('text')` |
 | Config store event subscriptions (`cp.register()` / `on()` / `unregister()`) | **UNVERIFIED** — said to require the event socket, but no test cited | Poll with `get()` on an interval |
 
 ### Alerts: what was actually observed
 
 This repo previously stated in three places that custom alerts require the
 on-router SDK application context and therefore cannot work from a container.
-**That was wrong, and it had never been tested.** A container with only the
-`$CONFIG_STORE` volume, no SDK app registration of any kind, sent the `alert`
-verb, the Config Store replied `Alert added(...)`, and the alerts appeared in the
-NCM console within seconds as `Custom Alert` rows against the correct device.
+**That was wrong, and it had never been tested.** On an **R980-5GD running NCOS
+7.26.21**, a container with only the `$CONFIG_STORE` volume and no SDK app
+registration of any kind sent the `alert` verb and the Config Store replied
+`Alert added(...)`.
+
+**What that establishes is acceptance at the Config Store, not delivery.
+Whether an accepted alert reaches the NCM console is UNVERIFIED**, and so is
+anything about how the console renders it. Everything below marked as console
+behaviour inherits that gap.
 
 The wire format is three fields, and the field count is strict:
 
@@ -501,15 +506,14 @@ alert\n<value>\n             ->  no reply; the socket blocks waiting for the
 
 Behaviour worth knowing before using it:
 
-- **`<name>` does not reach NCM.** The socket echoes it as a prefix
-  (`Alert added('<name>: <value>')`), but the console displays only `<value>` —
-  alerts sent with and without a name render identically. Put anything you need
-  to see inside the value.
-- **A malformed command still creates an alert.** The two-field form blocks the
-  client *and* produces an NCM entry reading
-  `Router NCOS App Generated Alert` with none of your text. So an incomplete or
-  empty alert is worse than no alert: it is an unfilterable placeholder in a
-  human-facing console. `cp.alert()` refuses empty values for this reason.
+- **`<name>` is a prefix on the alert text, not a separate field.** The socket
+  echoes it as `Alert added('<name>: <value>')`. It may be empty. Whether the NCM
+  console displays it is UNVERIFIED, so put anything you need to see inside the
+  value.
+- **Send neither an empty nor a malformed alert.** The two-field form blocks the
+  client, and an empty value is still accepted by the router. What the console
+  shows for either is UNVERIFIED. `cp.alert()` refuses empty values rather than
+  risk an unfilterable placeholder in a human-facing channel.
 - **Newlines in alert text would inject protocol fields.** Alert text usually
   carries interpolated data, so sanitise it. `cp.alert()` collapses newlines and
   tabs to spaces.
@@ -520,9 +524,10 @@ Behaviour worth knowing before using it:
 - Omitting a field does not error — it hangs. Any client sending this verb needs
   a receive timeout.
 
-Alerts are synced rather than streamed, and they are a shared, rate-limited,
-human-facing channel. Send transitions and exceptions, not periodic samples, and
-debounce anything derived from a noisy signal.
+Alerts are a shared, human-facing channel. Send transitions and exceptions, not
+periodic samples, and debounce anything derived from a noisy signal. Whether they
+are rate-limited, and what latency the router-to-NCM sync adds, are UNVERIFIED —
+both follow from console delivery, which has not been observed.
 
 The lesson worth carrying: the original claim named a specific plausible
 mechanism ("requires the on-router SDK application context") and was recorded as

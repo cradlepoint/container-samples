@@ -4,10 +4,10 @@
     {
       "name": "Read Docs Before Task",
       "trigger": "UserPromptSubmit",
-      "description": "Before starting a spec task, read the container development documentation and lessons learned to understand constraints and best practices for building containers on Cradlepoint NCOS routers.",
+      "description": "Before starting a task, read the container platform facts and development documentation to understand the constraints and best practices for building containers on Cradlepoint NCOS routers.",
       "action": {
         "type": "agent",
-        "prompt": "Before starting this task, read the following documentation files to understand the constraints and best practices for building containers on Cradlepoint NCOS routers:\n1. docs/container-development-guide.md\n2. docs/ncos-sdk-reference.md\n3. docs/memory-resources.md\n4. .kiro/steering/lessons-learned.md\n\nApply the knowledge from these docs and any lessons learned to the task you are about to execute."
+        "prompt": "Before starting this task, read the following to understand the constraints and best practices for building containers on Cradlepoint NCOS routers:\n1. .kiro/steering/container-platform-limits.md — the authoritative platform facts: compose rules, networking, volumes, health checks, per-model memory, Config Store behaviour, measured image sizes, and the standing UNVERIFIED list. This one is already loaded automatically; use it as the starting point rather than re-deriving anything in it.\n2. docs/container-development-guide.md\n3. docs/ncos-sdk-reference.md\n4. docs/memory-resources.md\n\nRead docs/cs-sock-protocol.md as well if the task touches cs.sock or a non-Python Config Store client.\n\nApply that knowledge to the task. Where a fact carries an UNVERIFIED marker, treat it as an open question rather than a limitation: do not build a workaround, add a dependency or drop a feature to route around an untested claim without testing it first. `.kiro/steering/lessons-learned.md` is a closed archive and is NOT required reading — load it manually with #lessons-learned only when you need the history or the evidence behind a specific fact."
       }
     }
   ]

@@ -113,8 +113,10 @@ engine API chatter, so whether the same lines are retrievable through
 `status/log` over REST is **not** established — if you need programmatic access
 rather than a human reading `log show`, verify that separately.
 
-`alert()` remains the only channel *confirmed end to end* to the NCM console as a
-structured, filterable event; the log is prose.
+`alert()` is the only channel intended to reach the NCM console as a structured,
+filterable event rather than as prose. Note that its delivery to the console is
+UNVERIFIED — see "NCM Custom Alerts" below — so it is not a confirmed-end-to-end
+alternative to the log.
 
 ### Log Prefix and APP_NAME
 
@@ -271,9 +273,14 @@ name can mean opposite things in different sections — see
 ## NCM Custom Alerts
 
 `alert()` works from a container with only the `$CONFIG_STORE` volume — no SDK
-application registration. Verified end-to-end: sent from a container, appeared in
-the NCM console as a `Custom Alert` row against the correct device (R980,
-NCOS 7.26.21).
+application registration. Verified on an **R980-5GD running NCOS 7.26.21**: the
+container sent the `alert` verb and the Config Store replied `Alert added(...)`.
+The wire form is exactly three fields, `alert\n<name>\n<value>\n`, and the
+response body is a plain string rather than JSON.
+
+**`Alert added` is local acceptance, not delivery. Whether an accepted alert
+reaches the NCM console is UNVERIFIED**, so every row below describing console
+behaviour is UNVERIFIED too.
 
 ```python
 cp.alert(f'tank level critical: {level}%')   # True if the router accepted it
@@ -282,16 +289,16 @@ cp.alert(f'tank level critical: {level}%')   # True if the router accepted it
 | Behaviour | Detail |
 |-----------|--------|
 | Return | `True` only when the router accepted it. `False` on an empty value, a rejection, or no Config Store |
-| `name` | Defaults to `APP_NAME`. Sent because the protocol requires the field, but **NCM does not display it** — put anything you need to see in `value` |
-| Empty value | Refused, and nothing is sent. An empty value still creates an alert on the router, but NCM shows the placeholder `Router NCOS App Generated Alert` with no detail |
+| `name` | Defaults to `APP_NAME`. Sent because the protocol requires the field, and the socket echoes it as a prefix on the text. Whether NCM displays it is UNVERIFIED — put anything you need to see in `value` |
+| Empty value | Refused, and nothing is sent. An empty value is still accepted by the router; what the NCM console shows for it is UNVERIFIED |
 | Newlines / tabs | Collapsed to spaces. The protocol is newline-delimited, so unsanitised text would inject protocol fields |
 | Non-ASCII | Replaced. Commands are ASCII-encoded; UTF-8 support is untested |
 | Length | Truncated at 1024 characters with an ellipsis. The real ceiling is unknown |
-| Latency | Alerts sync rather than stream; allow up to a few minutes |
+| Latency | UNVERIFIED, since console delivery has not been observed |
 
-Alerts are a shared, rate-limited, human-facing channel. Send transitions and
-exceptions, not periodic samples, and debounce anything derived from a noisy
-signal or the console fills with duplicates.
+Alerts are a shared, human-facing channel. Send transitions and exceptions, not
+periodic samples, and debounce anything derived from a noisy signal. Whether the
+channel is rate-limited is UNVERIFIED.
 
 ## Application Configuration (appdata)
 
@@ -438,7 +445,7 @@ router it runs on through the Config Store socket, which involves no credentials
 at all — do not bake router credentials into an image to use this instead.
 
 ```bash
-set -a && . ./.env && set +a          # or export CP_ROUTER_HOST / _PASSWORD
+# credentials come from .env at the repo root; no export step
 python3 -c "import cp; cp.use_rest(); print(cp.get_lat_long())"
 python3 cp.py --rest status/gps/fix   # same thing from the CLI
 ```
@@ -456,11 +463,16 @@ cp.transport()                                   # 'socket' or 'rest'
 | `use_socket()` | Switch back, discarding the credentials |
 | `transport()` | `'socket'` or `'rest'` |
 
-Anything not passed explicitly comes from the environment: `CP_ROUTER_HOST`,
-`_USERNAME`, `_PASSWORD`, `_SCHEME`, `_VERIFY_TLS`, `_TIMEOUT`, falling back to
-the `NCOS_DEV_*` names that `.env` and [tools/README.md](../tools/README.md)
-already use — so an exported `.env` drives this module with no rewriting.
-`RestTarget.describe()` reports where each value came from.
+Anything not passed explicitly comes from `.env` at the repo root: the
+`NCOS_DEV_HOST`, `_USERNAME`, `_PASSWORD`, `_SCHEME`, `_VERIFY_TLS`, `_TIMEOUT`
+keys that [tools/README.md](../tools/README.md)
+already use — read directly from that file, with no export step.
+
+**`.env` is the only credential source besides explicit arguments.** Process
+environment variables are deliberately not read, so a router address lives in
+exactly one place and editing the file takes effect on the next call — there is no
+second source where a stale value can hide and silently aim this at the wrong
+router. `RestTarget.describe()` reports where each value came from.
 
 ### What does not cross this transport
 
@@ -499,11 +511,12 @@ convenience.
 
 Worth being precise about how exposed this actually is, rather than louder than
 the facts support. `.env` is a development-host file — gitignored, never copied
-into an image — so `CP_ROUTER_HOST` and friends are not normally present in a
-container at all. For REST to engage inside one, all three of these have to hold:
+into an image — so the credential keys are not present in a container at all, and
+this module reads them from nowhere else. For REST to engage inside one, all three
+of these have to hold:
 
-1. Credentials reach the container, via a deliberate compose `environment:` entry
-   or Dockerfile `ENV`.
+1. A `.env` carrying credentials is deliberately built into the image, or the
+   values are passed to `use_rest()` explicitly in code.
 2. Something calls `use_rest()`. It is never called for you.
 3. Either the Config Store socket is absent, **or** `force=True` is passed.
 
@@ -515,7 +528,7 @@ reliable way to know it is on a router otherwise (nothing in the container
 namespace is a confirmed marker, and inferring one from an artifact string is how
 this repo has been wrong before). What protects that case is condition 2: nothing
 calls `use_rest()` unless you wrote the call. A container that never calls it
-cannot reach REST no matter what is in its environment.
+cannot reach REST regardless of what files or variables it carries.
 
 So the rules exist so that no single mistake is enough, not because a stray
 variable could redirect a container on its own.
@@ -583,7 +596,10 @@ All optional, all read from the environment at import.
 | `CP_TIMEOUT` | `2.0` | Seconds for a whole socket request/response exchange, not per `recv()` |
 | `CP_MAX_RESPONSE_BYTES` | `4194304` | Ceiling on one response. `get` with `tree=1` can return a very large subtree, and the smallest routers have 135 MB for all containers |
 | `CP_PROBE_COOLDOWN` | `30.0` | How long `config_store_available()` caches a failure before re-probing |
-| `CP_ROUTER_*` / `NCOS_DEV_*` | unset | REST transport target; see [Remote Router](#remote-router-rest-transport). Never causes a fallback on their own |
+
+Router credentials are **not** environment variables. The REST transport reads
+`NCOS_DEV_*` keys from `.env` on a development host only; see
+[Remote Router](#remote-router-rest-transport).
 
 ## Usage Pattern
 

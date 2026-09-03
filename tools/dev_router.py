@@ -7,9 +7,12 @@ Config Store socket, with no credentials involved. This module exists for the
 other side of the workflow: driving a dev router from a workstation to set
 appdata, inspect container state, and read logs while iterating.
 
-Configuration comes from `.env` at the repo root (see `.env.example`), with real
-environment variables taking precedence so a password manager or CI can inject
-the password without writing it to disk.
+Configuration comes from `.env` at the repo root (see `.env.example`), and from
+nowhere else. Process environment variables are deliberately ignored: this tool
+only runs on a development host where `.env` always exists, so a second source
+buys nothing and costs real confusion -- an exported value outranked the file and
+did not track edits to it, which made a corrected router address look like an
+unreachable router. Pass values explicitly in code to override one.
 
     python3 tools/dev_router.py init                     # create .env, mode 600
     python3 tools/dev_router.py check                    # verify access
@@ -157,16 +160,22 @@ def check_env_permissions(path: str = ENV_PATH) -> Optional[str]:
 
 
 def load(env_path: str = ENV_PATH) -> Settings:
-    """Load settings from `.env`, letting real environment variables win."""
+    """Load settings from `.env`. That file is the only source.
+
+    Process environment variables are deliberately ignored. This tool only ever
+    runs on a development host, where `.env` always exists, so a second source
+    buys nothing and costs real confusion: an exported `NCOS_DEV_*` value used to
+    outrank the file and not track edits to it, so a corrected router address read
+    as "the router is unreachable" rather than "your edit is being ignored", and a
+    stale address that happened to be live drove the wrong device. Edit `.env`, or
+    pass values explicitly in code.
+    """
     from_file = parse_env_file(env_path)
     settings = Settings()
     sources: Dict[str, str] = {}
 
     def resolve(name: str) -> Optional[str]:
         key = _PREFIX + name
-        if os.environ.get(key):
-            sources[name.lower()] = "environment"
-            return os.environ[key]
         if from_file.get(key):
             sources[name.lower()] = ".env"
             return from_file[key]

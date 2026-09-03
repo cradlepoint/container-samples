@@ -22,7 +22,7 @@ data at a path.
 `rest` speaks the router's HTTP/REST API, for driving a *remote* router from a
 development machine:
 
-    export NCOS_DEV_HOST=192.168.0.1 NCOS_DEV_PASSWORD=...   # or CP_ROUTER_*
+    # credentials come from .env at the repo root; no export step
     python3 -c "import cp; cp.use_rest(); print(cp.get_product_name())"
 
 Every accessor in this module works over either transport, so code written
@@ -40,19 +40,22 @@ enforced rather than merely conventional:
      unless passed `force=True`, which exists only for the deliberate case of
      reaching a *different* router.
 
-REST is a development-host transport. `.env` is a development-host file too --
-gitignored, never copied into an image -- so its variables are not normally
-present in a container at all. Do not bake router credentials into an image to
-change that. See `use_rest()` for the rest of the security notes.
+REST is a development-host transport, and `.env` at the repo root is its only
+credential source besides explicit arguments. `.env` is a development-host file --
+gitignored, never copied into an image -- so it simply does not exist in a
+container, which is correct: the socket needs no credentials and `use_rest()` is
+refused on the router. Do not bake router credentials into an image to change
+that. See `use_rest()` for the rest of the security notes.
 
 Responses are unwrapped: `cp.get('status/system')` returns the data itself, so
 never write `cp.get(...).get('data')`. The REST API wraps replies as
 `{"success": true, "data": ...}`; this module unwraps them so both transports
 present the same shape.
 
-`alert()` sends a custom alert to NCM and works from a container -- verified
-end-to-end on an R980 (NCOS 7.26.21), where the alerts appeared in the NCM
-console as "Custom Alert" entries.
+`alert()` sends a custom alert to NCM and works from a container -- verified on an
+R980-5GD (NCOS 7.26.21) from a container holding only the $CONFIG_STORE volume,
+with no SDK app registration. The Config Store replied `Alert added(...)`. That is
+local acceptance; whether the alert reaches the NCM console is UNVERIFIED.
 
 Not implemented, because there is no evidence they work from a container:
 
@@ -546,22 +549,57 @@ class RestTarget:
         return ('https', 'http') if self.scheme == 'auto' else (self.scheme,)
 
 
-# Primary names, then the names tools/dev_router.py and .env already use, so an
-# exported .env drives this module without being rewritten.
+# The keys read from `.env`, which is the only source of REST credentials besides
+# explicit arguments. Process environment variables are deliberately not read:
+# credentials belong in one place, and a second source that silently outranks the
+# file makes a stale value indistinguishable from an unreachable router.
 _REST_ENV_NAMES = {
-    'host': ('CP_ROUTER_HOST', 'NCOS_DEV_HOST'),
-    'username': ('CP_ROUTER_USERNAME', 'NCOS_DEV_USERNAME'),
-    'password': ('CP_ROUTER_PASSWORD', 'NCOS_DEV_PASSWORD'),
-    'scheme': ('CP_ROUTER_SCHEME', 'NCOS_DEV_SCHEME'),
-    'verify_tls': ('CP_ROUTER_VERIFY_TLS', 'NCOS_DEV_VERIFY_TLS'),
-    'timeout': ('CP_ROUTER_TIMEOUT', 'NCOS_DEV_TIMEOUT'),
+    'host': ('NCOS_DEV_HOST',),
+    'username': ('NCOS_DEV_USERNAME',),
+    'password': ('NCOS_DEV_PASSWORD',),
+    'scheme': ('NCOS_DEV_SCHEME',),
+    'verify_tls': ('NCOS_DEV_VERIFY_TLS',),
+    'timeout': ('NCOS_DEV_TIMEOUT',),
 }
+
+# `.env` lives at the repo root on a development host. It is gitignored and never
+# copied into an image, so this path simply does not exist in a container -- which
+# is correct: on the router the socket needs no credentials, and use_rest() is
+# refused there anyway.
+DOTENV_PATH = os.path.join(os.getcwd(), '.env')
+
+
+def _read_dotenv(path: Optional[str] = None) -> Dict[str, str]:
+    """Parse `.env` into a dict. Returns {} when it is absent or unreadable.
+
+    Deliberately tolerant: `#` is only a comment at the start of a line, since it
+    is an ordinary password character, and at most one matching outer quote pair
+    is stripped.
+    """
+    values: Dict[str, str] = {}
+    try:
+        with open(path or DOTENV_PATH, 'r', encoding='utf-8', errors='replace') as handle:
+            lines = handle.readlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, _, raw = line.partition('=')
+        key = key.strip()
+        raw = raw.strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
+            raw = raw[1:-1]
+        values[key] = raw
+    return values
 
 
 def _resolve_rest_setting(key: str) -> Tuple[Optional[str], str]:
+    from_file = _read_dotenv()
     for name in _REST_ENV_NAMES[key]:
-        if os.environ.get(name):
-            return os.environ[name], name
+        if from_file.get(name):
+            return from_file[name], f'.env:{name}'
     return None, 'default'
 
 
@@ -582,13 +620,16 @@ def use_rest(host: Optional[str] = None, username: Optional[str] = None,
     reaching a *different* router from this one, which means accepting
     credentials inside the image.
 
-    Anything not passed explicitly is read from the environment:
-    `CP_ROUTER_HOST` / `USERNAME` / `PASSWORD` / `SCHEME` / `VERIFY_TLS` /
-    `TIMEOUT`, or the `NCOS_DEV_*` equivalents that `.env` and
-    `tools/dev_router.py` already use:
+    Anything not passed explicitly is read from `.env` at the repo root -- the
+    same `NCOS_DEV_HOST` / `USERNAME` / `PASSWORD` / `SCHEME` / `VERIFY_TLS` /
+    `TIMEOUT` keys `tools/dev_router.py` uses. No export step is needed:
 
-        set -a && . ./.env && set +a
         python3 -c "import cp; cp.use_rest(); print(cp.get_lat_long())"
+
+    `.env` is the only source besides explicit arguments. Process environment
+    variables are deliberately not read for credentials, so there is no second
+    place a stale router address can hide: edit the file and the next call uses
+    it. `RestTarget.describe()` reports the source of each value.
 
     Note that `.env` is a development-host file -- gitignored, never copied into
     an image -- so these variables are not normally present in a container at
@@ -664,10 +705,9 @@ def use_rest(host: Optional[str] = None, username: Optional[str] = None,
     if missing:
         raise ValueError(
             'the REST transport is not configured: '
-            + ', '.join(f'{name} not set' for name in missing)
-            + '. Pass host=/password= explicitly, or export those variables '
-              '(the NCOS_DEV_* names from .env work too). Not defaulting to an '
-              'address on purpose -- see use_rest() for why.'
+            + ', '.join(f'{name} not set in {DOTENV_PATH}' for name in missing)
+            + '. Set them in .env, or pass host=/password= explicitly. Not '
+              'defaulting to an address on purpose -- see use_rest() for why.'
         )
     if resolved_scheme not in ('auto', 'https', 'http'):
         raise ValueError(f"scheme must be auto, https or http (got {resolved_scheme!r})")
@@ -1031,26 +1071,28 @@ def alert(value: str = '', name: Optional[str] = None) -> bool:
     """Send a custom alert to NCM. Returns True if the router accepted it.
 
     Works from a container with only the `$CONFIG_STORE` volume attached -- no
-    SDK application registration is needed. Verified end-to-end on an R980
-    (NCOS 7.26.21): the alerts appeared in the NCM console as "Custom Alert"
-    entries carrying `value` as their text.
+    SDK application registration is needed. Verified on an R980-5GD
+    (NCOS 7.26.21): the container sent the verb and the Config Store replied
+    `Alert added('<name>: <value>')`. Any claim that alerts need the on-router
+    SDK application context is wrong and was never tested.
 
         cp.alert(f'tank level critical: {level}%')
 
+    **`Alert added` is local acceptance, not delivery. Whether the alert reaches
+    the NCM console is UNVERIFIED**, and so is anything about how the console
+    renders it, what latency the sync adds, or whether the channel is
+    rate-limited. Treat alerts as a shared human-facing channel regardless: send
+    transitions and exceptions, not periodic samples, and debounce anything
+    derived from a noisy signal.
+
     `name` defaults to APP_NAME and is sent because the protocol requires the
-    field, but **NCM does not display it** -- alerts sent with and without a
-    name render identically in the console. Do not rely on it to distinguish
-    sources; put anything you need to see inside `value`.
+    field. The socket treats it as a prefix on the alert text rather than a
+    separate field, and it may be empty. Whether NCM displays it is UNVERIFIED,
+    so put anything you need to see inside `value`.
 
-    Alerts are synced to NCM rather than streamed, so expect a delay of up to a
-    few minutes. They are also a shared, rate-limited, human-facing channel:
-    send transitions and exceptions, not periodic samples. Debounce anything
-    derived from a noisy signal, or the console fills with duplicates.
-
-    Returns False, having sent nothing, when `value` is empty. An empty value
-    still creates an alert on the router, but NCM shows it as the placeholder
-    "Router NCOS App Generated Alert" with no detail, which is worse than no
-    alert at all.
+    Returns False, having sent nothing, when `value` is empty. The router accepts
+    an empty value, and what NCM would show for it is UNVERIFIED -- refusing is
+    cheaper than finding out from an unfilterable entry in someone's console.
 
     Socket transport only: there is no REST equivalent for this verb.
     """
@@ -1061,8 +1103,8 @@ def alert(value: str = '', name: Optional[str] = None) -> bool:
 
     text = _sanitise_alert_field(value)
     if not text:
-        log('alert: refusing to send an empty alert -- NCM would show it as '
-            '"Router NCOS App Generated Alert" with no detail')
+        log('alert: refusing to send an empty alert -- the router accepts one, '
+            'and what NCM shows for it is unverified')
         return False
     if len(text) > _ALERT_MAX_CHARS:
         text = text[:_ALERT_MAX_CHARS - 3] + '...'
@@ -1723,8 +1765,8 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     if not state['available']:
         if state['transport'] == 'socket':
             log('no Config Store. Attach the $CONFIG_STORE volume to this '
-                'service, or use --rest with CP_ROUTER_HOST/PASSWORD set to '
-                'reach a remote router.')
+                'service, or use --rest with NCOS_DEV_HOST/PASSWORD set in '
+                '.env to reach a remote router.')
         else:
             log('router not reachable over REST.')
         return 1

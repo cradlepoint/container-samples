@@ -93,8 +93,10 @@ alert\nmy_app\ntank level critical: 92%\n
 
 ### The `alert` verb specifically
 
-Confirmed on hardware: `alert` sends a custom alert to NCM using only the
-Config Store socket — no on-router SDK application registration is needed.
+Confirmed on hardware (R980-5GD, NCOS 7.26.21): the Config Store accepts `alert`
+over this socket alone — no on-router SDK application registration is needed.
+Acceptance is what was observed; **whether the alert reaches the NCM console is
+UNVERIFIED**, so the console-behaviour notes below are UNVERIFIED with it.
 
 ```
 alert\n<name>\n<value>\n     ->  status: ok, body: Alert added('<name>: <value>')
@@ -108,15 +110,15 @@ alert\n<value>\n             ->  no reply at all; the socket blocks waiting
   because this is the verb most likely to be hand-built with a variable
   field count (e.g. omitting `name` when not needed). Always send the verb
   and both fields, even if `name` is an empty string.
-- `name` is a **prefix** on the delivered text, not a separate field NCM
-  displays — the console shows only `value`. Don't rely on `name` to
-  distinguish sources.
+- `name` is a **prefix** on the text the socket echoes back, not a separate
+  field, and it may be empty. Whether NCM displays it is UNVERIFIED, so don't
+  rely on `name` to distinguish sources — put what you need inside `value`.
 - Newlines and tabs in `value` (and `name`) must be stripped or replaced with
   spaces before sending — the protocol is newline-delimited, so an embedded
   newline injects an extra field and desyncs the command.
-- An empty `value` still creates an NCM alert, showing the placeholder
-  "Router NCOS App Generated Alert" with no detail. Refuse to send empty
-  alert text at the client level; the router will not refuse it for you.
+- An empty `value` is still accepted by the router. What NCM shows for it is
+  UNVERIFIED. Refuse to send empty alert text at the client level; the router
+  will not refuse it for you.
 - Response body for `alert` is a **plain string**, not JSON — see "Response
   body encoding" below.
 
@@ -176,7 +178,7 @@ router:
 | Status | Meaning |
 |--------|---------|
 | `ok` | Request succeeded |
-| *(firmware-dependent string)* | The exact success/failure vocabulary beyond `ok` is not fully catalogued and may vary by firmware version. **Never branch application logic on the exact `status` string for a write's success** — confirm a `put`/`post`/`delete` actually took effect by reading the path back afterward. This is a "the response format" note; the earlier `alert` fields note it too, since `alert` is the specific case that's been verified end-to-end. |
+| *(firmware-dependent string)* | The exact success/failure vocabulary beyond `ok` is not fully catalogued and may vary by firmware version. **Never branch application logic on the exact `status` string for a write's success** — confirm a `put`/`post`/`delete` actually took effect by reading the path back afterward. This is a "the response format" note; the earlier `alert` fields note it too, since `alert` is the specific case whose request and response have been observed on hardware. |
 
 Client-side synthetic statuses (produced by your own parsing code, not sent
 by the router) are useful to distinguish transport failures from protocol
@@ -332,6 +334,13 @@ observation from testing against this protocol, not a hypothetical).
 Bind a mock `AF_UNIX` listener to a temporary path and reply in this wire
 format. For a Python client, override `cp.SOCKET_PATH` to point at it — the
 constant exists to be overridden for exactly this.
+
+`cp.py` reads two paths, and a test must redirect **both**: `SOCKET_PATH`, and
+`DOTENV_PATH` for the `.env` file the REST transport takes its credentials from.
+A test that leaves either at its default reads the real file on the developer's
+machine, which makes the result depend on who runs the suite rather than on the
+code. Add any new path constant to the saved-state list in the suite's base
+`TestCase` as well, or it leaks into every test that runs after it.
 
 `cp.py`'s own suite works this way and is worth reading as a worked example, both
 of the mock and of which failure modes are worth covering:

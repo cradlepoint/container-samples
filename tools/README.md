@@ -19,10 +19,15 @@ which to reach for — two overlapping mechanisms are worse than either one:
   inside a program you are developing. It refuses to engage where the Config
   Store socket exists, so the same code on the router always uses the socket.
 
-Both read the same `NCOS_DEV_*` variables, so one `.env` configures both — export
-it (`set -a && . ./.env && set +a`) and `cp.use_rest()` picks it up. See
-"Remote Router (REST transport)" in
+Both read the same `NCOS_DEV_*` keys from `.env`, so one file configures both. No
+export step is needed — `cp.use_rest()` reads `.env` directly. See "Remote Router
+(REST transport)" in
 [../docs/ncos-sdk-reference.md](../docs/ncos-sdk-reference.md).
+
+**`.env` is the only credential source for both tools.** Process environment
+variables are deliberately not read, so there is exactly one place a router
+address or password lives and editing the file takes effect on the next command.
+Pass values explicitly in code when you need to override one.
 
 ## Development router access
 
@@ -37,13 +42,8 @@ python3 tools/dev_router.py check
 `check` prints the model, serial, firmware and any container projects, and never
 prints the password.
 
-Real environment variables override the file, so the password need never touch
-disk:
-
-```bash
-NCOS_DEV_PASSWORD="$(op read op://vault/dev-router/password)" \
-    python3 tools/dev_router.py check
-```
+`check` reports which source each value came from, so a missing or empty key in
+`.env` is visible rather than mysterious.
 
 ### Usage
 
