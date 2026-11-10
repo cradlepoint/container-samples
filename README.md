@@ -280,20 +280,15 @@ services:
 
 ### Resource Constraints
 
-Router hardware has limited CPU and memory compared to server environments. Consider:
+Router hardware has limited memory compared to server environments, but NCOS gives
+you no Compose lever to manage it. CPU constraints are not supported, and
+`mem_limit` is reported to make containers fail with unknown errors — leave both
+out. `deploy.resources` is not an alternative either; it is ignored on Compose
+`2.4`.
 
-- **Memory limits** — Set appropriate memory caps to prevent a container from exhausting system resources
-- **CPU limits** — Restrict CPU usage to leave headroom for router operations
-- **Restart policies** — Configure automatic restart behavior for fault tolerance
-
-```yaml
-version: '2.4'
-services:
-  my-service:
-    image: my-image:latest
-    mem_limit: 128M
-    restart: unless-stopped
-```
+Keep memory in check by building minimal images against the per-model budget in
+[docs/memory-resources.md](docs/memory-resources.md). Use restart policies for
+fault tolerance.
 
 ### Restart Policies
 
@@ -363,7 +358,6 @@ services:
     environment:
       - API_ENDPOINT=https://api.example.com
       - LOG_LEVEL=info
-    mem_limit: 128M
     restart: unless-stopped
 
 networks:

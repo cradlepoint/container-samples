@@ -25,12 +25,17 @@ is needed.
   architectures; a package existing for arm64 does not mean it exists for
   arm/v7, and the most memory-constrained models are the arm/v7 ones.
 - Alpine is the default base and uses musl libc, not glibc. Pin the tag
-  (`alpine:3.18`), because router images get rebuilt months apart and an
-  unpinned base changes the Python version and package set silently.
+  (`alpine:3.18`, whose `python3` is 3.11.12), because router images get rebuilt
+  months apart and an unpinned base changes the Python version and package set
+  silently.
 - The engine is `cpdockerengine`. It exposes no Docker API and no Docker socket;
   the interfaces are the `container` CLI and `status/container` over REST.
 - Containers run user-namespace remapped with no root on NCOS. File ownership
-  appears as `nobody:nobody`. Remapping also affects SysV IPC: a daemon using
+  appears as `nobody:nobody`, and the remap base shows up in the engine's own
+  paths — `status/container` reported container directories under
+  `/var/mnt/containers/165536.165536/` on an R2400-5GF-NA running NCOS 7.26.81,
+  which is a cheap way to confirm remapping is active. Remapping also affects
+  SysV IPC: a daemon using
   shared memory logs `shmctl(...) for IPC_RMID failed, Operation not permitted`
   at shutdown. That message is benign; verify the daemon's actual service
   instead of chasing it.
@@ -44,11 +49,29 @@ is needed.
   a design the router supports, present locally ships one that fails on deploy.
   Before running a local experiment, name what the result is a property of — "this
   image" or "this code" is answerable locally, "this kernel" or "this engine" is not.
+- The router kernel differs by model/firmware: R2400-5GF-NA on NCOS 7.26.100
+  (build a324e6ff71) runs `6.6.52-ge0f9e2afd4cf-dirty` aarch64 (Yocto/poky, GCC
+  13.3.0); an earlier, unrecorded router ran `5.4.213-coconut+`. Probe results
+  taken on one kernel do not carry over to the other. The NCOS CLI has no `uname`
+  (`Invalid command: uname`) and `status/` carries no kernel version, so read it
+  from inside any container: `uname -r` / `cat /proc/version`.
 
 ## Compose
 
-- Compose file version is `2.4`. Memory caps use `mem_limit`, not
-  `deploy.resources`.
+- Compose file version is `2.4`.
+- Do **not** set `mem_limit`. Reported to cause containers to fail with unknown
+  errors on NCOS (device model and firmware not captured), so leave it out and
+  control memory by building minimal images against the per-model budget below,
+  not by capping it in Compose. `deploy.resources` is not the alternative — it is
+  ignored on `2.4`. Whether `mem_limit` breaks on all models/firmware or only
+  some is UNVERIFIED, but the standing guidance is to omit it.
+- CPU constraints are not supported either, so omit `cpus:`, `cpu_shares` and
+  `cpuset`. There is no Compose lever for CPU or memory on NCOS at all; the only
+  controls are a minimal image and a restart policy. UNVERIFIED how the engine
+  reacts to a `cpus:` key — reported unsupported rather than tested, and
+  `docs/ncos-api/control/container.md` previously documented `cpus: 2` as
+  working, so treat a `cpus:` entry found in an existing project as untrustworthy
+  evidence.
 - The router pulls pre-built images from a registry. A `build:` directive is not
   supported on the device; build off-router with `docker buildx` and push.
 - Compose YAML is a plain string field in a config array under
@@ -115,9 +138,11 @@ is needed.
 - Bridge networking only. `network_mode: host` is not supported, so a design
   needing the router's own network namespace does not work; give the container
   its own IP on a Local IP Network instead.
-- The default bridge assigns `172.17.0.0/16` starting at `172.17.0.2`, and the
-  router is the gateway. Services on it are reachable only through `ports:`
-  mappings.
+- The default bridge assigns `172.17.0.0/16` starting at `172.17.0.2` — a
+  default, not a fixed value: it comes from `config/container/daemon_opts/bip`
+  (read as `172.17.0.1/16` on an E3000-C18B running NCOS 7.26.81) and can be
+  changed where it collides with a real network. The router is the gateway.
+  Services on it are reachable only through `ports:` mappings.
 - Custom networks need NCOS 7.2.50+. A compose network binds to an NCM Local IP
   Network via `com.cradlepoint.network.bridge.uuid` under `driver_opts`. The UUID
   must match an existing Local IP Network and the declared `subnet`/`gateway`
@@ -161,9 +186,11 @@ is needed.
   not captured, so treat as one router and one firmware and re-probe on the
   target): `cap_add: NET_ADMIN` is honoured, a `devices:` mapping of
   `/dev/net/tun` is honoured, TUN creation works, netfilter `nat`/`filter` rules
-  install, and `net.ipv4.ip_forward` is `1`.
-- The **nf_tables backend has no usable `nat` table on these routers; the legacy
-  `ip_tables` backend works.** Debian 12 and current Alpine both symlink
+  install, and `net.ipv4.ip_forward` is `1`. None of this was re-probed on the
+  6.6.52 kernel (R2400-5GF-NA, 7.26.100) — UNVERIFIED there.
+- The **nf_tables backend has no usable `nat` table on the 5.4.213 router; the
+  legacy `ip_tables` backend works.** On 6.6.52 the nft `nat` table is UNVERIFIED,
+  so probe both backends rather than pinning legacy. Debian 12 and current Alpine both symlink
   `iptables` to the nft implementation, so a container calling bare `iptables`
   gets the backend that fails — the binary runs and the syntax is accepted, only
   rule insertion fails. Probe both and use whichever has a working `nat` table.
@@ -210,6 +237,13 @@ is needed.
 - Named volumes are shared between services in the same project by mounting the
   same name. Volume data is **not** refreshed when a new image is deployed —
   create a new project to get fresh volume data.
+- **That persistence is confirmed, and it is useful rather than merely a
+  caveat: volume contents survive an image swap in the same project.** 174.7 MB
+  of files written through the running container were intact at the same mount
+  path after `container pull <project>` replaced the image and restarted it,
+  on an **R2400-5GF-NA running NCOS 7.26.81**. So a named volume is the right
+  home for data that must outlive an upgrade, and the "new project for fresh
+  data" rule is the cost of that, not a risk to design around.
 - Treat a named volume as optional: check whether the mount point exists
   (`os.path.isdir('/data')`) at startup and fall back to `/tmp`, so a missing
   volume degrades to non-persistent instead of crashing.
@@ -266,6 +300,14 @@ Analytics in NCM) frees memory; both need a reboot.
 Flash: 6 GB on AER2200, IBR1700, E300 and R1900; 8 GB on R2100, R920 and R980;
 14 GB on E3000.
 
+Newer models are absent from both tables above and from the architecture table.
+**R2400-5GF-NA** runs `linux/arm64` (an arm64-only single-platform image pulled
+and ran on NCOS 7.26.81) and reports `memtotal` 2.01 GB with 1.32 GB available
+at idle — but its *container allowance*, which is what these tables measure, is
+not established, so do not read total RAM as the budget. When a model is missing
+here, read `status/system/memory` for headroom and confirm the architecture by
+deploying a small arm64 image rather than assuming either.
+
 ## Measured image sizes
 
 Image size is a **flash** and pull-time cost. Resident set is what competes with
@@ -276,19 +318,133 @@ rule a design out on memory grounds.
 
 | Contents | arm64 | arm/v7 | Note |
 |---|---|---|---|
-| Alpine 3.18 + `python3` + small network daemon + client tools + app source | 60.6 MB | 48.1 MB | 62 / 50 MiB installed; runs comfortably under `mem_limit: 64M` |
+| Alpine 3.18 + `python3` + `cp.py` + a polling app, nothing else | 53.5 MB | 42.1 MB | The floor for this stack. RSS 7.0 MiB idle by local `docker stats`; most of the image is `python3` and its deps |
+| Alpine 3.18 + `python3` + small network daemon + client tools + app source | 60.6 MB | 48.1 MB | 62 / 50 MiB installed; resident set stays well under 64 MB |
 | Alpine 3.18 + `python3` + network daemon (34 packages) | 58.1 MB | 45.6 MB | 59 / 47 MiB installed |
 | Alpine + `ffmpeg` + Go binary | 116 MB | 75.9 MB | ffmpeg's shared-library closure pulls ~110 packages transitively |
 | Debian 12-slim + network daemon + optional plugins | 121–132 MB | 69 MB | daemon RSS with a session established: **4.4 MiB** |
+| python:3.12-slim + numpy + opencv-python-headless + onnxruntime + 32 MB of models | 361 MB | n/a | 105–118 MiB by local `docker stats`; the same workload reported **451.7 MiB** on-router. arm64 only — neither onnxruntime nor opencv-python-headless publishes an armv7l wheel |
 
-Typical samples land at 45–60 MB. Adding compiled Python wheels (numpy, opencv,
-tflite) moves an image into the hundreds of megabytes, which is what makes the
-135 MB floor on AER2200 and IBR1700 the real constraint for heavier workloads.
-Install `opencv-python-headless`, not `opencv-python`, to avoid pulling Qt and
-GTK. Prefer Alpine where it can do the job — the reason is flash and pull time,
-not the memory floor. A pull runs over the router's primary WAN; check
-`status/wan/primary_device` first, because a name beginning `mdm-` means the pull
-is cellular, slow and billable.
+**A local `docker stats` figure and the router's own number are not the same
+measurement, so do not size against the local one.** The row above differs by
+4x: `docker stats` reports a cache-excluded working set, while
+`status/container`'s `stats.memory_stats.usage` counts page cache too, and a
+video pipeline reading large files generates a lot of it. Observed on an
+**R2400-5GF-NA running NCOS 7.26.81**. Which figure to budget against is
+**UNVERIFIED** — subtract `memory_stats.stats.cache` (or read
+`memory_stats.stats.rss`) from the on-router payload to get the comparable
+number, and do that before concluding a workload fits a per-model allowance.
+
+Typical samples land at 42–60 MB. Adding compiled Python wheels (numpy, opencv,
+tflite, onnxruntime) moves an image into the hundreds of megabytes, which is what
+makes the 135 MB floor on AER2200 and IBR1700 the real constraint for heavier
+workloads. Install `opencv-python-headless`, not `opencv-python`, to avoid
+pulling Qt and GTK. Prefer Alpine where it can do the job — the reason is flash
+and pull time, not the memory floor — but **`onnxruntime` and
+`opencv-python-headless` publish no `musllinux` wheels at all, so Alpine forces a
+source build and a Debian slim base is the lower-cost answer for those two.**
+**Pull cost is the compressed manifest size, not `docker image ls`.** The
+364 MB image above is 142 MB over the wire, measured by summing the layer sizes
+in its registry manifest. Quote the compressed figure when the cost under
+discussion is WAN data, and the uncompressed one when it is flash:
+
+```bash
+# Anonymous, and it is what the router will actually download. The Accept list
+# must carry the OCI types as well: the registry answers with the media type it
+# has stored regardless of what is asked for, so a docker-v2-only Accept still
+# returns an OCI index and the sum below then fails on a missing `layers` key.
+ACCEPT='application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json'
+tok=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$REPO:pull" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+curl -s -H "Authorization: Bearer $tok" -H "Accept: $ACCEPT" \
+  "https://registry-1.docker.io/v2/$REPO/manifests/latest" \
+  | python3 -c 'import json,sys;m=json.load(sys.stdin);print(sum(l["size"] for l in m["layers"])/1e6,"MB") if "layers" in m else print("index or error:",m.get("errors") or m.get("mediaType"))'
+```
+
+**A multi-arch tag answers with an index, which carries no `layers`** — read
+`manifests[]`, pick the entry whose `platform` is `linux`/`arm64`, and re-request
+its `digest` to get the per-platform size. Confirmed against `library/alpine`
+(4.2 MB arm64) and `library/python:3.12-slim` (43.5 MB). This repo's own
+`:latest`/`:latest-armv7` convention pushes single-platform images, which answer
+directly, so the index path matters mostly when sizing a *base* image.
+
+That check also confirms the image is anonymously pullable, which it must be
+when `config/container/registry` is empty. A private or misnamed repository
+returns a body of `[{"code": "UNAUTHORIZED", ...}]` rather than a size, so the
+two outcomes are distinguishable. **A single `401` from it is not
+evidence the repository is private** — the token request itself fails
+intermittently, and retrying returned `200` for a repo that had just reported
+`401`. Retry before concluding anything about visibility.
+
+A pull runs over the router's primary WAN; check `status/wan/primary_device`
+first, because a name beginning `mdm-` means the pull is cellular, slow and
+billable. The **name prefix is the usable signal** — the per-device
+`status/wan/devices/<dev>/status/type` field read as `null` for every device,
+cellular and ethernet alike, on an E3000-C18B running NCOS 7.26.81. Enumerate
+`status/wan/devices` to see whether a disconnected ethernet WAN is available;
+connecting one before a multi-hundred-megabyte pull is cheaper than the data.
+Get the device owner's explicit agreement before pulling a large image over
+cellular — it is their metered link, not a build resource.
+
+**The `opencv-python-headless` wheels bundle FFmpeg**, so `cv2.VideoCapture(url,
+cv2.CAP_FFMPEG)` reads RTSP with no extra dependency — adding PyAV alongside it
+carries a second copy of libav* for a capability the image already has (~33 MB of
+wheel on arm64). Confirm with `cv2.getBuildInformation()` in the built image
+rather than trusting the wheel to keep doing it.
+
+**The router is roughly an order of magnitude slower per core than a
+development machine, so divide local latency by ~0.1 before believing it.**
+Identical ONNX graphs, identical thread count, same arm64 image, measured
+on an **R2400-5GF-NA running NCOS 7.26.81** against Docker Desktop on Apple
+silicon:
+
+| Graph | Development machine | R2400 | Factor |
+|---|---|---|---|
+| YOLOv9-t 256px detector | 10.5 ms | 120 ms | 11.4x |
+| YOLOv9-t 384px detector | 22.7 ms | 264 ms | 11.6x |
+| YOLOv9-t 512px detector | 39.3 ms | 458 ms | 11.7x |
+| small OCR model, batch of 2 | 2.7 ms | 28 ms | 10.4x |
+
+The factor is strikingly consistent at ~11x across graph sizes, which makes it
+usable for planning — but it is one router, one firmware and one host, so treat
+it as an order-of-magnitude guide rather than a constant.
+
+**This reverses conclusions, it does not just scale them.** Confirmed by
+measurement, not predicted: a 256 px detector lost to a 384 px one on the
+development machine on every accuracy measure, and beat it on the router, where
+being 2.3x cheaper meant analysing 2.3x more frames and finding more distinct
+objects per minute. An ROI crop that improved results locally made them worse on
+the router, because at the router's lower sample rate the partial detections at
+the crop boundary came to dominate. **Tune on the device; a local ranking of
+configurations is not evidence about the router's ranking.**
+
+**Lowering the source resolution does not make a letterboxing model cheaper.**
+Detectors with a fixed input tensor resize every frame to the same square, so
+inference cost is set by the model, not the input: the same three detectors
+measured 120 / 264 / 458 ms at 720p, 1080p and 1440p alike. Source resolution
+changes only decode and resize (total loop time went 182 -> 211 -> 246 ms) and
+the pixel density of whatever gets cropped out for a second-stage model. So
+reach for a smaller *model* or a longer frame interval to buy CPU, and choose
+resolution for the crop quality the second stage needs.
+
+**Set the inference thread count explicitly; "use every available core" is past
+the optimum.** Measured in built arm64 images on an 8-core host (Docker Desktop
+on Apple Silicon — treat the shape of the curve as the finding, not the absolute
+milliseconds), all-cores was slower than a lower count in every
+runtime/model combination tried:
+
+| Runtime / model | 1 | 2 | 4 | 8 (all) |
+|---|---|---|---|---|
+| onnxruntime, YOLOv9-t 384 FP32 | 91 ms | **79 ms** | 93 ms | 142 ms |
+| onnxruntime, CCT OCR (batch 2) | 25 ms | **15 ms** | — | 30 ms |
+| litert/XNNPACK, SSD MobileNet V2 | 23 ms | 14 ms | **10 ms** | 11 ms |
+| litert/XNNPACK, YOLOv5n INT8 | 12 ms | 9 ms | **7 ms** | 10 ms |
+
+The optimum is runtime- and model-dependent — onnxruntime peaked at 2 threads on
+these graphs while litert/XNNPACK scaled usefully to 4 — so **measure it for your
+own model rather than copying a number**, and never leave it at "auto". All-cores
+also pegs the CPU the container shares with router services, and NCOS offers no
+Compose CPU lever at all, so the thread count and the work rate are the only CPU
+controls that exist and both have to be set inside the container.
 
 ## Config Store from inside a container
 
@@ -336,6 +492,15 @@ is cellular, slow and billable.
 - A missing `$CONFIG_STORE` volume is indistinguishable from empty data; both
   give `None`. Probe a path that always has data (`status/product_info`) at
   startup and periodically, and surface the difference in any status output.
+- **A socket that accepts and never answers costs the full `CP_TIMEOUT` per
+  call, so reading many settings at startup is a multi-minute stall, not a fast
+  failure.** An absent socket fails immediately; a hung one does not, and a hung
+  Config Store is what a wedged container engine looks like from inside. Bind and
+  serve the status interface *before* loading configuration, and stop touching
+  the socket after the first failure plus one `config_store_available()` probe.
+  Measured: ~30 settings, each a read plus a provisioning write, took over two
+  minutes before the process reached its own `listen()` — two minutes in which
+  the page that would have reported the problem refused connections.
 - Read a `config/...` path before writing it. `None` means the path is absent on
   this firmware, and a blind write there is undetectable afterwards.
 - `cp.py` is standard library only; `py3-requests` is not needed. Its accessors
@@ -435,11 +600,34 @@ alert\n<value>\n             ->  no reply; the socket blocks waiting for the
   Run by hand at an interactive prompt on the router it works normally. So a
   probe whose result must be read belongs in the container's own entrypoint with
   the answer logged, not in a scripted `exec`.
+- **`container pull <project>` re-pulls the project's images and restarts it**,
+  so pushing a new build to the same tag and running it is the whole redeploy
+  loop — no project delete-and-recreate and no NCM UI. The new image was live
+  about 30 seconds after the command on an **R2400-5GF-NA running NCOS
+  7.26.81**, and it survived everything that should survive: named-volume
+  contents, appdata settings, and the project's compose string. Confirm the swap
+  by comparing the container's `Image` field in `status/container` against the
+  pushed manifest's `config.digest` rather than by watching a timestamp. The
+  command prints nothing over non-interactive SSH, which is normal.
+- `container restart` is not a subcommand; the CLI's usage text offers only the
+  project API, `list`, `logs` and `exec`. To cycle a container, use
+  `container pull <project>`, or toggle the project's `enabled` field in
+  `config/container/projects`.
 - `container list`, `container logs` and `container exec` have no REST
   equivalent, so host-side tooling needs an SSH path as well as HTTP. Prefer REST
-  for structured status reads: `cat /status/log` over SSH returns content tooling
-  treats as binary, while the same data over REST parses as JSON
-  (`[timestamp, facility, level, message]`).
+  for structured status reads: **both `cat /status/log` and `log show` over SSH
+  emit NUL bytes**, so `grep` answers `Binary file (standard input) matches` and
+  a filtered read silently returns nothing — pipe through `tr -d '\000'` or use
+  `grep -a` if you must parse the SSH output. Observed on an R2400-5GF-NA
+  running NCOS 7.26.81.
+- **A `status/log` row over REST is
+  `[timestamp, level, facility, message, extra]` — five elements, with level at
+  index 1 and facility at index 2.** Confirmed by reading a row verbatim on an
+  R2400-5GF-NA running NCOS 7.26.81: level is one of `INFO`/`WARN`/`ERR` and
+  facility is a subsystem or container name (`containers`, `kernel`,
+  `netcloud`, `httpserver`, or the container's own name). Filtering on the wrong
+  index returns zero matches, which reads as "that subsystem logged nothing" and
+  produced exactly that wrong conclusion about engine health here.
 - REST wraps replies as `{"success": true, "data": ...}` while the SDK returns
   data directly. Host-side tooling should unwrap and should raise on
   `success: false`, so a rejected path is not mistaken for an empty one.
@@ -450,7 +638,28 @@ alert\n<value>\n             ->  no reply; the socket blocks waiting for the
   DeadlineExceeded`; a reboot clears it. **Engine not running**:
   `status/container` returns `null` *promptly* with zero `containers`-facility
   lines. A prompt `null` and a hang look alike to a script checking for truthy
-  data and mean opposite things.
+  data and mean opposite things. **Read `status/wan/connection_state` before
+  any of these**: with the WAN `disconnected`, an E3000-C18B on NCOS 7.26.100
+  showed the "engine not running" signature (prompt `null`, zero
+  `containers` lines in 2090 log rows) with two projects configured. Whether
+  the engine is actually down without WAN or just idle is UNVERIFIED; either
+  way no pull can start, so fix the WAN first.
+- **A healthy engine reports a pull in progress, so a prompt `null` during one
+  really does mean the engine is broken.** With a project configured,
+  `status/container` returns
+  `{"<project>": {"state": {"state": "pulling", "info": {"services":
+  {"<service>": {"current": <bytes>, "total": <bytes>}}}}}}`, moving to
+  `state: "running"` with a full Docker-style `info` block once the container
+  starts. Observed on an **R2400-5GF-NA running NCOS 7.26.81**. Poll `state` and
+  the byte counters for pull progress rather than inferring it from WAN
+  counters. It returns `null` before any project exists, and also with projects
+  configured when the WAN is down or the engine is not running (previous bullet).
+- On an **E3000-C18B running NCOS 7.26.81**, `status/container` returned a prompt
+  `null` for ten minutes while the pull was demonstrably running (109 MB in 45 s
+  on the WAN byte counters) and `status/log` carried one
+  `ERR containers Error during event loop execution`. Per the row above that is
+  an unhealthy engine, not a normal idle state — do not reinterpret a prompt
+  `null` during an active pull as benign.
 - `container list` reads project config, so it answers normally while the engine
   is dead. A command succeeding is not evidence its subsystem is healthy — check
   what the command's data source actually is.
@@ -461,6 +670,14 @@ alert\n<value>\n             ->  no reply; the socket blocks waiting for the
   debugging why something will not deploy. Config and a licensed feature entry
   both survive a firmware upgrade that leaves the engine absent, so neither is
   evidence of engine health.
+- **`status/feature` carries entitlements in `db`, an array of
+  `[uuid, name, expires_days, remaining_days]`** — match on element 1, e.g.
+  `"Container Orchestration"`. The object's only top-level keys are `db` and
+  `expiring_alert`, so a top-level lookup for a feature name returns nothing on
+  a fully licensed device and reads as "not entitled". Observed on an
+  **E3000-C18B running NCOS 7.26.81**, where Container Orchestration is licensed
+  with 1300 days remaining. Shape documented in
+  `docs/ncos-api/status/feature.md`.
 - An empty `config/container/registry` array means anonymous Docker Hub pulls,
   which is all a public image needs.
 
@@ -480,8 +697,6 @@ costs unnecessary architecture, not just a wrong sentence.
 - Strict field counts for `get`/`put`/`post`/`delete`/`decrypt` (confirmed for
   `alert` only).
 - Whether host-to-container Unix socket bind mounts work (deliberately avoided).
-- Whether named-volume data survives an image redeploy in the same project (the
-  documented rule is that it is not refreshed; the failure direction is untested).
 
 When a probe closes one of these, record the result with the **device model and
 firmware version** next to it. Without those the observation cannot be scoped and
