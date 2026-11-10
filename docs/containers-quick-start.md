@@ -216,6 +216,24 @@ mv main_copy.py main.py
   | **Hangs / times out** | Present, with `daemon is not responding ... DeadlineExceeded` | Engine wedged. A reboot clears it |
   | **Returns `null` promptly** | **None at all** | Engine not running. Nothing is even attempting the pull |
 
+  **The top row is what a healthy pull looks like, and it is specific.** With a
+  project configured, `status/container` returns
+  `{"<project>": {"state": {"state": "pulling", "info": {"services":
+  {"<service>": {"current": <bytes>, "total": <bytes>}}}}}}`, then
+  `state: "running"` once the container starts (observed on an **R2400-5GF-NA
+  running NCOS 7.26.81**). So poll `state` and the byte counters, and treat a
+  prompt `null` *while a pull is actually moving data* as the bottom row rather
+  than as an idle engine — that combination was seen on an **E3000-C18B running
+  NCOS 7.26.81** alongside `ERR containers Error during event loop execution`,
+  and it was a broken engine. `status/container` is also `null` before any
+  project exists.
+
+  **Check `status/wan/connection_state` before reading the table.** With the WAN
+  `disconnected`, an E3000-C18B on NCOS 7.26.100 matched the bottom row exactly
+  (prompt `null`, no `containers` lines) with two projects configured. Whether
+  the engine is down or merely idle without WAN is UNVERIFIED; no pull can start
+  either way, so restore the WAN before diagnosing the engine.
+
   Absence of log lines from a facility is a positive signal, not a lack of
   information: count facilities in `status/log` to see which subsystems are
   alive. Check all of this before re-reading your own compose file — when the

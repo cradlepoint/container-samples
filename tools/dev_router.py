@@ -16,6 +16,7 @@ unreachable router. Pass values explicitly in code to override one.
 
     python3 tools/dev_router.py init                     # create .env, mode 600
     python3 tools/dev_router.py check                    # verify access
+    python3 tools/dev_router.py registry alpr            # push target vs router
     python3 tools/dev_router.py get status/product_info
     python3 tools/dev_router.py get status/container
     python3 tools/dev_router.py put config/system/gps/enabled true
@@ -115,6 +116,17 @@ class Settings:
     scheme: str = "auto"
     verify_tls: bool = False
     timeout: float = 10.0
+    #: Image namespace to build and push to, e.g. `phate999` for Docker Hub or
+    #: `ghcr.io/owner/repo`. Not a credential -- `docker push` authenticates
+    #: from your own `docker login`, not from anything in `.env`.
+    registry: str = ""
+    #: Only for a registry the ROUTER must authenticate to, i.e. a private
+    #: image. These are what `config/container/registry` on the device wants.
+    #: A public image needs none of them, because an empty registry array means
+    #: anonymous pulls.
+    registry_server: str = ""
+    registry_username: str = ""
+    registry_password: str = field(default="", repr=False)
     # Where each value came from, for `check` output and troubleshooting.
     sources: Dict[str, str] = field(default_factory=dict, repr=False)
 
@@ -125,7 +137,10 @@ class Settings:
             f"Settings(host={self.host!r}, username={self.username!r}, "
             f"password=<redacted:{'set' if self.password else 'empty'}>, "
             f"scheme={self.scheme!r}, verify_tls={self.verify_tls!r}, "
-            f"timeout={self.timeout!r})"
+            f"timeout={self.timeout!r}, registry={self.registry!r}, "
+            f"registry_username={self.registry_username!r}, "
+            f"registry_password="
+            f"<redacted:{'set' if self.registry_password else 'empty'}>)"
         )
 
     @property
@@ -142,8 +157,27 @@ class Settings:
             "scheme": self.scheme,
             "verify_tls": self.verify_tls,
             "timeout": self.timeout,
+            "registry": self.registry or None,
+            "registry_auth": (
+                "set" if self.registry_password else "none (anonymous pull)"
+            ),
             "sources": self.sources,
         }
+
+    def image(self, sample: str, tag: str = "latest") -> str:
+        """Full image reference for a sample, from the configured namespace.
+
+        Lowercased: OCI repository names must be all-lowercase, and a sample
+        directory name read off a case-insensitive filesystem is not guaranteed
+        to already be.
+        """
+        if not self.registry:
+            raise DevRouterError(
+                f"{_PREFIX}REGISTRY is not set in .env, so there is no "
+                "namespace to build an image reference from. Set it to e.g. "
+                "'yourname' for Docker Hub or 'ghcr.io/owner/repo'."
+            )
+        return f"{self.registry.rstrip('/').lower()}/{sample.lower()}:{tag}"
 
 
 def check_env_permissions(path: str = ENV_PATH) -> Optional[str]:
@@ -193,6 +227,10 @@ def load(env_path: str = ENV_PATH) -> Settings:
     scheme = resolve("SCHEME")
     verify = resolve("VERIFY_TLS")
     timeout = resolve("TIMEOUT")
+    registry = resolve("REGISTRY")
+    registry_server = resolve("REGISTRY_SERVER")
+    registry_username = resolve("REGISTRY_USERNAME")
+    registry_password = resolve("REGISTRY_PASSWORD")
 
     settings.host = (host or "").strip().rstrip("/")
     # Tolerate a scheme pasted into the host, rather than failing obscurely
@@ -215,6 +253,10 @@ def load(env_path: str = ENV_PATH) -> Settings:
         settings.timeout = float(timeout) if timeout else 10.0
     except ValueError:
         raise DevRouterError(f"{_PREFIX}TIMEOUT must be a number (got {timeout!r})")
+    settings.registry = (registry or "").strip().rstrip("/")
+    settings.registry_server = (registry_server or "").strip()
+    settings.registry_username = (registry_username or "").strip()
+    settings.registry_password = registry_password or ""
     settings.sources = sources
     return settings
 
@@ -497,6 +539,64 @@ def _cmd_check() -> int:
     return 0
 
 
+def _cmd_registry(sample: Optional[str] = None) -> int:
+    """Report the push namespace and what the router is set up to pull from.
+
+    Read-only. These are two different things and conflating them is the usual
+    cause of a pull that fails with `unauthorized`: `docker push` uses your own
+    `docker login`, while the router authenticates from
+    `config/container/registry` -- or not at all, which is correct for a public
+    image.
+    """
+    settings = load()
+    print("push namespace (from .env):")
+    print(f"  NCOS_DEV_REGISTRY   {settings.registry or 'NOT SET'}")
+    if sample:
+        try:
+            print(f"  image for {sample!r}:   {settings.image(sample)}")
+        except DevRouterError as exc:
+            print(f"  image for {sample!r}:   unavailable -- {exc}")
+    print("  push auth           your local 'docker login', not .env")
+
+    if not settings.configured:
+        print("\nrouter not configured in .env, skipping the device read.")
+        return 1
+
+    entries = get("config/container/registry", settings=settings)
+    print(f"\nrouter {settings.host} config/container/registry:")
+    if not entries:
+        print("  []  -> anonymous pulls only, which is all a PUBLIC image needs.")
+    elif isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                print(
+                    "  server=%s username=%s password=%s"
+                    % (
+                        entry.get("server"),
+                        entry.get("username"),
+                        "set" if entry.get("password") else "unset",
+                    )
+                )
+            else:
+                print(f"  {entry!r}")
+    else:
+        print(f"  unexpected shape: {entries!r}")
+
+    if settings.registry_password and not entries:
+        print(
+            "\nnote: NCOS_DEV_REGISTRY_PASSWORD is set in .env but the router "
+            "has no registry entry, so it would pull anonymously and fail on a "
+            "private image. Add the entry to config/container/registry."
+        )
+    if not settings.registry_password and not entries:
+        print(
+            "\nSo the image has to be PUBLIC for this router to pull it. A "
+            "public repository is world-visible and effectively permanent -- "
+            "do not push anything to it you would not publish."
+        )
+    return 0
+
+
 def _parse_value(text: str) -> Any:
     """JSON first, plain string otherwise, so both `true` and `eth0` work."""
     try:
@@ -515,6 +615,8 @@ def main(argv=None) -> int:
     try:
         if command == "init":
             return _cmd_init()
+        if command == "registry":
+            return _cmd_registry(rest[0] if rest else None)
         if command == "check":
             return _cmd_check()
         if command == "get":

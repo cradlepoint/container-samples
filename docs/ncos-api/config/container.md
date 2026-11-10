@@ -66,7 +66,6 @@ services:
     container_name: my_service
     network_mode: bridge
     restart: unless-stopped
-    mem_limit: 64M
     volumes:
       - $CONFIG_STORE
 '''
@@ -88,6 +87,17 @@ array:
 
 ```python
 dev_router.put(f'config/container/projects/{project_id}/config', compose)
+```
+
+To remove a project, DELETE its array index. The index is positional, so look
+it up by name on every call rather than assuming `0` — other projects may sit
+in front of yours, and deleting the wrong index removes someone else's project.
+Confirmed with read-back on an E3000-C18B running NCOS 7.26.100:
+
+```python
+projects = dev_router.get('config/container/projects') or []
+for i in reversed([i for i, p in enumerate(projects) if p['name'] == 'my-project']):
+    dev_router.delete(f'config/container/projects/{i}')
 ```
 
 Notes:

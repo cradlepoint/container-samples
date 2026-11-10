@@ -62,9 +62,20 @@ small network daemon and its client tools, plus `cp.py` and application source:
 | `linux/arm64` | 58.1 MB | 59 MiB (34 packages) |
 | `linux/arm/v7` | 45.6 MB | 47 MiB (34 packages) |
 
-An Alpine plus Python container of this shape runs comfortably under a
-`mem_limit` of 64 MB. Treat these as a baseline: adding compiled Python wheels
-(numpy, opencv, tflite) moves an image into the hundreds of megabytes, which is
+Strip the daemon and its client tools and you reach the floor for this stack:
+Alpine 3.18 with `python3`, `cp.py` and a polling application measures **53.5 MB
+on `linux/arm64` and 42.1 MB on `linux/arm/v7`**, with a 7.0 MiB resident set at
+idle by local `docker stats`. Most of that image is `python3` and its
+dependencies, so an app-only sample has little room left to trim.
+
+An Alpine plus Python container of this shape keeps its resident set well under
+64 MB. Do **not** cap it with a `mem_limit` in Compose — on NCOS that is reported
+to cause containers to fail with unknown errors (device model and firmware not
+captured). Control memory by building minimal images against the per-model budget
+above, not by setting a limit. Treat these sizes as a baseline: adding compiled
+Python wheels
+(numpy, opencv, tflite, onnxruntime) moves an image into the hundreds of
+megabytes (measured below at 361 MB for one such stack), which is
 what makes the AER2200 and IBR1700 floor of 135 MB the real constraint for
 heavier workloads.
 
@@ -82,6 +93,38 @@ both numbers, from `docker image ls` and `docker stats` respectively, and judge
 each against the constraint it actually consumes. A non-Alpine base is still worth
 avoiding where Alpine can do the job, but the reason is flash and pull time, not
 the memory floor.
+
+A second measurement at the heavy end, for the computer-vision workload class:
+
+| Platform | Image size | Local `docker stats` | On-router `memory_stats.usage` |
+|----------|-----------|----------------------|--------------------------------|
+| `linux/arm64` | 361 MB | 105–118 MiB | 451.7 MiB |
+
+That is `python:3.12-slim` plus `numpy`, `opencv-python-headless` and
+`onnxruntime`, carrying 32 MB of ONNX models, running a two-stage video pipeline
+(detector then a second model on each crop). The on-router figure comes from
+`status/container`'s `stats.memory_stats.usage` on an **R2400-5GF-NA running
+NCOS 7.26.81**.
+
+**The two columns are different measurements and the gap is 4x.** `docker stats`
+reports a cache-excluded working set; `memory_stats.usage` includes page cache,
+and a pipeline reading large video files generates a lot of it. Sizing a
+deployment against the local number is how a workload that "fits" turns out not
+to. Read `memory_stats.stats.rss` (or subtract `.stats.cache`) from the
+on-router payload for the comparable figure — which of the two to budget
+against here is **UNVERIFIED**, because that breakdown was not captured.
+
+The image size is the firmer constraint either way: it is three times the whole
+container allowance of an AER2200 and awkward against its flash budget. Flash
+and pull time are the binding
+constraints for this class of workload, not memory.
+
+Note also that this stack is **arm64 only**, because neither `onnxruntime` nor
+`opencv-python-headless` publishes an `armv7l` wheel — and Alpine is not an
+option for it either, because neither publishes a `musllinux` wheel. Check both
+tags per pinned version before choosing a base image; the method is in
+[container-development-guide.md](container-development-guide.md) under "Use
+Alpine Base Images".
 
 ## Key Takeaways for Container Development
 

@@ -186,7 +186,8 @@ curl -s -k -u admin:pass "https://ROUTER_IP/api/status/log"
 
 Container-related log entries use facilities: `containers`, `cpcontainer`. Filter by these to see pull progress, errors, and lifecycle events.
 
-Log entry format: `[timestamp, facility, level, message, null]`
+Log entry format: `[timestamp, level, facility, message, extra]` — level at
+index 1, facility at index 2 (confirmed on an R2400-5GF-NA running NCOS 7.26.81).
 
 Common log patterns:
 - `"Trying to pull IMAGE from https://registry-1.docker.io v2"` — pull starting
@@ -214,20 +215,24 @@ version: "2.4"                    # REQUIRED — not v3
 services:
   myservice:
     image: myimage:tag
-    restart: unless-stopped       # REQUIRED — "always" is rejected
+    restart: unless-stopped       # a restart policy is required; quote "no"
 ```
 
-### Resource Limits (Compose v2.4 syntax)
-```yaml
-services:
-  myservice:
-    image: myimage
-    mem_limit: 512m               # Memory limit
-    cpus: 2                       # CPU cores
-    shm_size: "1gb"               # Shared memory (for DBs, browsers)
-```
+### Resource Limits
 
-Do NOT use `deploy.resources.limits` — that's v3 Swarm syntax.
+NCOS supports no resource-limit keys. Omit all of them:
+
+- `cpus:`, `cpu_shares`, `cpuset` — CPU constraints are not supported (reported
+  unsupported; UNVERIFIED how the engine reacts to the key, and an earlier
+  revision of this file wrongly documented `cpus: 2` as working).
+- `mem_limit` — reported to cause containers to fail with unknown errors (device
+  model/firmware not captured).
+- `deploy.resources.limits` — v3 Swarm syntax, ignored on `2.4`.
+
+Control memory with a minimal image against the per-model budget in
+[../../memory-resources.md](../../memory-resources.md), and use a restart policy
+for fault tolerance. `shm_size: "1gb"` is unrelated to limits and sizes
+`/dev/shm`; UNVERIFIED whether the engine honours it.
 
 ### Networking
 ```yaml
@@ -311,7 +316,7 @@ docker buildx build --platform linux/arm64 \
 Then deploy:
 ```bash
 curl -s -k -u admin:pass -X POST "https://ROUTER_IP/api/config/container/projects/" \
-  -d 'data={"name":"ntopng","config":"version: \"2.4\"\nservices:\n  ntopng:\n    image: yourusername/ntopng:arm64\n    restart: unless-stopped\n    mem_limit: 512m\n    ports:\n      - \"3000:3000\"\n    volumes:\n      - ntopng-data:/var/lib/ntopng\nvolumes:\n  ntopng-data:\n    driver: local","enabled":true,"update_interval":0}'
+  -d 'data={"name":"ntopng","config":"version: \"2.4\"\nservices:\n  ntopng:\n    image: yourusername/ntopng:arm64\n    restart: unless-stopped\n    ports:\n      - \"3000:3000\"\n    volumes:\n      - ntopng-data:/var/lib/ntopng\nvolumes:\n  ntopng-data:\n    driver: local","enabled":true,"update_interval":0}'
 ```
 
 ---

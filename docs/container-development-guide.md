@@ -93,14 +93,22 @@ source with it enabled, that is a real decision with a size cost. Measure both
 architectures and report the numbers rather than switching bases silently or
 quietly dropping the feature.
 
-**The same principle applies to pip packages and arm/v7 specifically.** A pinned
-version installing cleanly for `linux/arm64` does not mean it has any wheel for
-`linux/arm/v7` — this is common, not an edge case, for the numpy-adjacent
-ecosystem (numpy, opencv-python-headless, PyAV, TFLite runtimes), because
-publishing armv7 binary wheels for compiled extensions is rare upstream even
-when arm64 wheels are routine. Check the *specific pinned version*, not just
-whether the package "supports ARM" in general — wheel availability varies by
-release, and a later version sometimes adds armv7 support an earlier pin lacks.
+**The same principle applies to pip packages, and along two axes: the C library
+and the architecture.** A pinned version installing cleanly for `linux/arm64` on
+Debian does not mean it has a `musllinux` wheel (which Alpine needs) or an
+`armv7l` wheel. Both gaps are common, not edge cases, for the numpy-adjacent
+ecosystem — numpy, opencv-python-headless, PyAV, TFLite runtimes, onnxruntime —
+because publishing binary wheels for compiled extensions beyond
+manylinux/arm64+x86_64 is rare upstream. Measured: `onnxruntime` and
+`opencv-python-headless` publish **no `musllinux` wheel of any architecture and
+no `armv7l` wheel**, which rules out Alpine and rules out AER2200/IBR1700 for
+anything built on them; `numpy` publishes musl wheels but no `armv7l`; `av`
+publishes both. The base-image choice follows from this, so settle it before
+writing a Dockerfile rather than discovering it in a failing build.
+
+Check the *specific pinned version*, not just whether the package "supports ARM"
+in general — wheel availability varies by release, and a later version sometimes
+adds armv7 support an earlier pin lacks.
 
 Confirm this from PyPI's package index directly rather than from
 `pip download`/`pip install` failures, which return the identical
@@ -113,9 +121,16 @@ curl -s https://pypi.org/simple/<package-name>/ | grep -o '<package_name>-<versi
 ```
 
 Read the tags directly: `manylinux_*_aarch64` / `macosx_*_arm64` cover arm64;
-`armv7l` in the tag (e.g. `manylinux_2_31_armv7l`) is what would cover arm/v7,
-and its absence across every listed wheel for that version is the actual
-evidence of no support — not a single failed `pip download` attempt. If a
+`armv7l` in the tag (e.g. `manylinux_2_31_armv7l`) is what would cover arm/v7;
+`musllinux_*` is what Alpine needs, and a `manylinux` wheel will not install
+there. The absence of the relevant tag across every listed wheel for that
+version is the actual evidence of no support — not a single failed
+`pip download` attempt. One line per question:
+
+```bash
+curl -s https://pypi.org/simple/<package>/ | grep -c armv7l
+curl -s https://pypi.org/simple/<package>/ | grep -c musllinux
+``` If a
 Dockerfile comment already states an architecture limitation for a pinned
 dependency, verify it this way before relying on it, especially before
 encoding it into automation (a CI build matrix, a per-architecture override)
@@ -251,6 +266,147 @@ fault.
 The inverse also applies deliberately: internal seams between processes in the
 same container *should* bind `127.0.0.1` so they are never reachable from the
 network, even by accident.
+
+### A Watchdog Timeout Does Not Cancel the Call It Gave Up On
+
+The standard way to bound a library call that can block for minutes is to run it
+on a throwaway thread and have the caller give up after a timeout. That bounds
+*the caller*. The call itself keeps running, and if it holds a lock that other
+calls into the same library need, **every abandoned attempt makes the next one
+slower** — so a retry loop against an unreachable dependency degrades instead of
+just failing.
+
+Measured with `cv2.VideoCapture` in a built arm64 image, opening a local file
+that takes 0.0 s on its own, while opens against a black-holed RTSP host were
+still in flight on other threads:
+
+| In-flight abandoned opens | Time to open the local file |
+|---|---|
+| 0 | 0.0 s |
+| 1 | 28.1 s |
+| 2 | 58.1 s |
+
+The practical symptom is the one that wastes a session: after an unreachable
+camera, a *corrected* URL also takes half a minute to connect, which reads as the
+new URL being wrong too.
+
+**Prefer bounding the operation with the library's own timeout option and calling
+it synchronously.** No orphan, no serialisation, and the failure time becomes a
+number you chose. The cost is that a SIGTERM arriving mid-call waits out that
+timeout, which is an argument for setting it in seconds rather than tens of
+seconds — not an argument for going back to the watchdog.
+
+When no such option exists, a watchdog thread is still the only tool, but treat
+each abandonment as a lasting cost: cap the number in flight, and prefer backing
+off to retrying hard.
+
+### FFmpeg: `timeout` Bounds an RTSP Open, `stimeout` Does Not
+
+For anything opening RTSP through FFmpeg — `cv2.VideoCapture` with
+`OPENCV_FFMPEG_CAPTURE_OPTIONS`, or PyAV's `options=` — the option that bounds
+the open is `timeout`, in microseconds. Measured against a black-holed host
+(`rtsp://192.0.2.1:554/...`) through OpenCV's FFmpeg backend in a built arm64
+image:
+
+| Option | Time for the open to fail |
+|---|---|
+| none | 30.1 s |
+| `stimeout;3000000` | 30.0 s — no effect |
+| `rw_timeout;3000000` | 30.0 s — does not cover the TCP connect |
+| `timeout;3000000` | **3.1 s** |
+
+`stimeout` is a deprecated alias and is a no-op in current builds, so a config
+that sets it has no timeout at all and inherits the ~30 s default. It appears in
+a great many published examples, including this repo's `edge_ai/src/capture.py`
+— **UNVERIFIED whether PyAV's own build behaves the same way**, since the
+measurement above was taken through OpenCV's backend; re-measure before relying
+on it either way. `timeout` did not break a working source in the same test.
+
+`rtsp_transport;tcp` is separately worth setting: UDP RTSP through the
+container's bridge NAT loses packets and produces torn frames that read as an
+application or model problem.
+
+### A File Source Has No Clock, So Decimation Has to Use Yours
+
+Any video pipeline that cannot process every frame drops some, and the obvious
+count to drop is `source_fps / target_fps - 1`. That is correct for a camera and
+wrong for a file, and the difference is not about the file ending — it is that
+**a camera paces itself and a file does not.** Frames arrive from a camera when
+the camera sends them, so a fixed ratio keeps up by construction. A decoder
+reading a file hands over the next frame whenever it is asked, so video time
+advances at whatever rate the loop manages, and the fixed ratio silently makes
+playback speed equal to `achieved_fps / target_fps`.
+
+That fraction is below 1 whenever inference costs more than the frame budget,
+which is the normal state on router silicon: `alpr`'s own measurements put
+yolo-v9-t-384 at 79 ms and cct-xs at 15 ms per frame in the built arm64 image,
+before annotation and the JPEG encode. Measured by driving `cv2.VideoCapture`
+over clips of a known frame rate with a `sleep` standing in for that cost — on
+a macOS arm64 development machine with the image's pinned `opencv-python-headless`
+and `numpy`, **not on a router**, since the quantity under test is the
+scheduler's arithmetic rather than anything the device decides:
+
+| clip | `target_fps` | work/frame | published | fixed ratio | wall clock |
+|---|---|---|---|---|---|
+| 10 fps | 8 | 0 ms | 8.2 fps | 0.82x | 0.98x |
+| 10 fps | 8 | 150 ms | 6.5 fps | 0.64x | 0.98x |
+| 10 fps | 8 | 300 ms | 3.3 fps | **0.33x** | 0.97x |
+| 60 fps | 8 | 300 ms | 3.2 fps | 0.43x | 0.95x |
+| 60 fps | 8 | 900 ms | 1.1 fps | 0.15x | 0.86x |
+| 10 fps | 30 | 0 ms | 10.2 fps | **3.01x** | 1.02x |
+
+Two rows carry the lesson. The first is slow at **0.82x with no processing
+cost at all**, because `round(10 / 8) - 1` is 0 and video time then cannot
+advance faster than the loop reads — an integer ratio is wrong even on
+infinitely fast hardware whenever `source_fps` is not a multiple of
+`target_fps`. And the last row runs at **3x**, so this is a speed bug in both
+directions: "drop frames to keep up" fixes only the slow half, and a reviewer
+who tests one direction ships the other.
+
+Schedule against the wall clock instead. Hold a playback clock and a frame
+position, and on each read deliver the frame that is *due* now — dropping as
+many as the shortfall requires, and waiting when there is no shortfall. Five
+details decide whether it works:
+
+- **Exclude live sources deliberately, and say why in the code.** `CAP_PROP_FPS`
+  over RTSP is frequently wrong or zero. Scheduling against a declared 30 fps
+  from a camera actually sending 10 computes a deficit that only grows and
+  leaves every read blocked in `grab()` waiting for frames that are not coming,
+  turning a bad metadata field into a source that returns no frames at all.
+- **Cap the catch-up, and seek past the cap.** Discarding frames with `grab()`
+  costs O(frames behind), so a source the decoder cannot decode in real time
+  falls further behind on every read. Beyond roughly half a second of video,
+  seek: that costs the distance to the preceding keyframe regardless of how far
+  ahead the target is. Prefer grabbing below the cap — it is cheaper per frame
+  and does not jump to a keyframe.
+- **Distinguish a stall from a shortfall.** Pause/resume, a model reload, a
+  configuration change and a "nobody is watching" grace period all produce a
+  long gap between reads. Treating that as being behind fast-forwards through
+  the clip on resume. Compare against the time of the previous read, not only
+  against the clock, and re-base the clock when the gap is longer than a second
+  or two.
+- **Restart the clock at the loop point.** A rewind that leaves the clock where
+  it was makes the scheduler believe it is a whole clip behind, and it seeks
+  straight back to the end.
+- **Keep the deliberate wait out of any latency you measure.** The hold belongs
+  to the schedule, not to the work, and a self-tuning loop that measures it as
+  work fights the scheduler: an adaptive rate controller read "the loop is over
+  budget", lowered the target a step at a time with a log line each, and wound
+  a 30 fps target down to the clip's 10 fps — which the hold had already
+  achieved for free. Time the work, subtract the wait.
+
+Which sources need this follows from the URL scheme, so settle it where the
+scheme is validated. `edge_ai` accepts `rtsp://` only and is correct with the
+fixed ratio; `alpr` accepts `file://` and `http(s)://...mp4` as well, and needs
+the clock for exactly those.
+
+Finally, **report the speed from the component that does the pacing**, and keep
+it separate from frame rate in the UI. They answer different questions — frame
+rate is how smooth the view is, playback speed is whether it is in real time —
+and a clip at 3 fps and 1.00x looks broken until the display says which of the
+two it is. This is the same rule as "report a status from whatever performs the
+action": nothing downstream can work the speed out, because the pipeline only
+sees frames arriving and the browser only sees one never-ending response.
 
 ### Vendoring a Prebuilt Binary (Multi-Arch)
 
@@ -564,6 +720,9 @@ Two things to get right in the adapter, whichever transport is used:
 ### Default Bridge Network
 
 By default, containers get IPs from `172.17.0.0/16`. The router is the gateway.
+The subnet is not fixed: it comes from `config/container/daemon_opts/bip` (read
+as `172.17.0.1/16` on an E3000-C18B running NCOS 7.26.81), so it can be moved
+where `172.17/16` collides with a real network on site.
 
 ### Custom Networks (NCOS 7.2.50+)
 
@@ -764,6 +923,41 @@ have actually observed the format. A wrong field pattern prints nothing while th
 check still looks like it ran, which is a silently empty status report — the worst
 kind, because it reads as "nothing to report".
 
+### Report a Status From Whatever Performs the Action, Not From a Correlate
+
+A status display is only as good as the signal it reads, and the two tempting
+signals are usually both wrong: an internal state label, and a client-side
+event that looks like evidence.
+
+Worked example, from a container streaming MJPEG with a "is video arriving"
+overlay. First attempt keyed the overlay on the capture layer's own
+`capture_state`. That is an internal label which goes `disconnected` every time
+a looping file source hits EOF and reopens, so the overlay covered working
+video almost continuously. Second attempt keyed it on the browser:
+**an `<img>` showing a `multipart/x-mixed-replace` stream does not fire a `load`
+event per frame, because the response is one body that never completes** — so
+client-side frame counting reports zero frames forever and pins the overlay on
+permanently. Both attempts shipped and both were user-visible.
+
+The component that *publishes* the frames is the only one that knows a frame
+was published, so it timestamps each publish and serves the age; the page
+compares that age to a threshold. State the rule generally: **pick the signal
+that is produced by the action itself, not one that merely correlates with
+it**, and give anything that reports a fault enough hysteresis to outlast the
+transients that are normal for the input. This is the same distinction as
+*installed is not loaded, loaded is not working* — applied to a UI.
+
+**Put `[hidden] { display: none !important; }` in any container's stylesheet.**
+The HTML `hidden` attribute is implemented by the browser's own stylesheet, so
+any author rule that sets `display` outranks it regardless of specificity:
+`.video-overlay { display: flex }` kept an 82%-opaque panel painted over the
+video however often the script set `element.hidden = true`. The symptom is a UI
+that looks dimmed or shows a stale message with no apparent cause, and it
+survives every correction to the logic deciding *when* to hide — three rounds
+of fixing the wrong thing here. Declare the global rule once rather than
+patching the one element you noticed; a per-element `[hidden]` override implies
+the attribute works everywhere else, which is the belief that cost the time.
+
 ### Verifying a Capability-Selected Branch
 
 A container that picks between implementations based on what the platform offers
@@ -797,6 +991,30 @@ Log which branch was selected, unconditionally and early. That line is the only
 thing that tells you which code is running on a device you cannot introspect — and
 it needs to survive the log buffer, which a verbose dependency will not let it do
 (see "Reading a Container's Log").
+
+**The same trap works on branches selected by the input, not the platform, and
+there it is easier to fall into because the fixture feels incidental.** A fix
+tested against a convenient sample exercises whichever branch that sample's
+properties select, and a deployment's real input selects the other one.
+
+Worked example: a video pipeline dropped surplus frames with `grab()` before
+decoding one, and the number skipped came from `source_fps / target_fps - 1`
+(a count that is itself wrong for a file — see "A File Source Has No Clock"
+above — but the branch it selects is the point here). The bundled 10 fps demo
+clip gives zero, the deployment's 60 fps source gives five to nineteen.
+End-of-file is therefore noticed in `read()` for the first and in the `grab()`
+loop for the second. A loop-the-clip fix that guarded only `read()` passed every
+local test and changed nothing on the router — three rounds of "fixed it" went
+out before the branch was found.
+
+So before testing a fix, name the input property the code branches on —
+frame rate, resolution, URL scheme, payload size, record count, whether a
+collection is empty — and either test each side or test with the real artifact.
+Asking the user for a representative input is cheaper than three deploy cycles.
+Relatedly, **distinguish "finished" from "failed" for any finite input**: a file
+that has played to its end is at a loop point, and treating that as a
+disconnect reopened the source and emitted five state-transition lines per
+loop into the log buffer shared with the whole router.
 
 ### Inducing States You Cannot Reach, by Shadowing the Status Command
 
@@ -1238,7 +1456,11 @@ unconfirmed: **`CAP_NET_RAW`** (raw sockets, for `ping`'s raw mode, packet craft
 `tcpreplay`) was not probed, and neither was whether a compose `sysctls:` entry is
 honoured. Model and firmware were not captured alongside the kernel version, so
 treat this as "one router, one firmware" rather than fleet-wide and re-probe on the
-target device.
+target device. That caution holds: an R2400-5GF-NA on NCOS 7.26.100 runs kernel
+`6.6.52-ge0f9e2afd4cf-dirty`, a different major version, and none of the table
+above has been re-run on it (UNVERIFIED there). Read the kernel from inside any
+container with `uname -r`; the NCOS CLI has no `uname` and `status/` does not
+report it.
 
 The XFRM result matters beyond IPsec: **the XFRM subsystem being reachable does not
 mean XFRM interfaces exist.** Those are separate kernel options, and a design
@@ -1263,11 +1485,13 @@ installed is capability policy.** Both fall in the "does not transfer" buckets
 above, so a NAT or firewall design that worked on a development machine has not
 been shown to work on the router — only that the rules and the logic are right.
 
-#### The nf_tables backend does not work; use legacy
+#### The nf_tables backend does not work on 5.4; probe both backends
 
 **This will break any container that runs `iptables` on these routers, silently and
 by default.** Observed on kernel `5.4.213-coconut+`: the **nf_tables** backend has
-no usable `nat` table, while the **legacy** `ip_tables` backend works fine.
+no usable `nat` table, while the **legacy** `ip_tables` backend works fine. On
+kernel `6.6.52` (R2400-5GF-NA, NCOS 7.26.100) the nft `nat` table is UNVERIFIED,
+so probe rather than pin.
 
 ```
 netfilter backend iptables-nft: no usable nat table, trying the next

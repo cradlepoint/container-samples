@@ -150,14 +150,18 @@ qos = cp.get('config/qos')  # {'enabled': bool, 'queues': [...], 'rules': [...]}
 
 ```python
 # REST API: GET /api/status/log/
-# Returns {"success": true, "data": [[timestamp, facility, level, message], ...]}
+# Returns {"success": true, "data": [[timestamp, level, facility, message, extra], ...]}
 # timestamp is Unix epoch (seconds), message is the log text
 ```
 
 - ALWAYS include timestamps when reading logs
 - Convert timestamps to human-readable with `datetime.fromtimestamp(ts)`
 - Filter by recency — after deploying, only look at logs with timestamps AFTER the deploy started
-- Log entry format: `[timestamp, facility, level, message]` — index 0 = epoch, index 3 = message text
+- Log entry format: `[timestamp, level, facility, message, extra]` — five elements:
+  index 0 = epoch, index 1 = level (`INFO`/`WARN`/`ERR`), index 2 = facility
+  (subsystem or container name), index 3 = message text. Confirmed by reading a
+  row verbatim on an R2400-5GF-NA running NCOS 7.26.81. Filtering on index 1 for
+  a facility returns zero matches and reads as "that subsystem logged nothing".
 
 ## Certificate Management
 

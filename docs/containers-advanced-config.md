@@ -98,7 +98,7 @@ volumes:
 ### Important Volume Notes
 
 - **No host filesystem mounts**: For security, volumes cannot mount to the host NetCloud OS filesystem
-- **Volume data persistence**: Data on a volume is NOT updated when a new image is deployed. Create a new project to get fresh volume data.
+- **Volume data persistence**: Data on a volume is NOT updated when a new image is deployed. Create a new project to get fresh volume data. Equally, that means volume contents **persist across an image upgrade in the same project** — 174.7 MB written by the running container was intact after `container pull <project>` replaced the image, on an R2400-5GF-NA running NCOS 7.26.81. Put anything that must outlive an upgrade on a named volume.
 - **Devices**: USB and serial ports can be mounted via the Devices section
 
 ## Mapping a USB Serial Port

@@ -11,8 +11,10 @@ which to reach for — two overlapping mechanisms are worse than either one:
 
 - **`dev_router.py` (here) is the operator tool.** It owns `.env` parsing and
   credential hygiene, and it covers the things REST cannot do at all: `container
-  list` / `logs` / `exec` over SSH, and deploying compose projects. Use it to
-  drive a router.
+  list` / `logs` / `exec` over SSH. Use it to drive a router. Deploying a
+  compose project is **not** a subcommand — a project is a `put` to
+  `config/container/projects`, which REST does fine, so use
+  `dev_router.py put` (or the NCM Compose Builder) for that.
 - **`cp.use_rest()` is for running container code off-router.** It points the
   same module a container imports at a remote router, so an application's logic
   can be exercised before it is ever containerised, with no code changes. Use it

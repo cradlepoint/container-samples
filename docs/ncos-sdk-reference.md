@@ -72,7 +72,7 @@ python3 cp.py --rest status/gps/fix         # see "Remote Router" below
 | `put(path, value='', query='', tree=0)` | `{'status': str, 'data': Any}`, or `None` if unreachable |
 | `post(path, value='', query='')` | Same as `put()` |
 | `delete(path, query='')` | Same as `put()` |
-| `log(value)` | `None`. Writes to stdout, collected by `container logs` |
+| `log(value)` | `None`. Writes to stdout, which on the router reaches the router log — see [Where log output actually goes](#where-log-output-actually-goes) |
 | `alert(value, name=None)` | `True` if the router accepted a custom alert for NCM |
 
 **Responses are unwrapped.** `cp.get('status/system')` returns the system dict
@@ -217,6 +217,32 @@ Repeated failures are logged once and then throttled to at most one line a
 minute, so a missing volume does not emit one line per poll forever. Throttling
 is by elapsed time, so the rate is the same whether you poll every second or
 every five minutes.
+
+### A hung socket is slow, not fast, and that shapes startup order
+
+An *absent* socket fails immediately. A socket that accepts a connection and
+never answers costs the full `CP_TIMEOUT` (2s by default) on every call, and that
+is what a wedged container engine looks like from inside a container.
+
+So the cost of reading configuration at startup is `settings x CP_TIMEOUT`, which
+is not noticeable against a healthy Config Store and is minutes against a hung
+one. Measured: ~30 settings, each a `get_appdata()` plus a provisioning
+`put_appdata()`, took **over two minutes** before the process reached its own
+`listen()` — two minutes in which the status page that would have reported the
+problem refused connections.
+
+Two rules follow, and they only matter in the failure case:
+
+- **Bind and serve the status interface before loading configuration.** Read only
+  what the listener itself needs (the port), with its default as the fallback.
+- **Circuit-break rather than retrying per setting.** On the first `None`, call
+  `config_store_available()` once; if it says unavailable, use built-in defaults
+  for the rest and skip provisioning entirely. This is the one place a gate
+  earns its keep — it is a breaker *after* a failure, not the
+  gate-before-every-read that the paragraphs below argue against — and it turns
+  `N x CP_TIMEOUT` into one timeout plus one probe. Report that the whole
+  configuration is defaults, so fallbacks are not presented as the operator's
+  settings.
 
 **A failed backend is re-probed, but only after a cooldown** (30s, or
 `CP_PROBE_COOLDOWN`). Within that window `config_store_available()` returns the
@@ -549,9 +575,11 @@ variable could redirect a container on its own.
   authenticated — fine on a trusted development LAN, not fine over the internet.
   Pass `verify_tls=True` once a certificate that validates is installed.
 
-For the host-side workflow around this — `.env` handling, `container logs` over
-SSH, deploying compose projects — use [tools/dev_router.py](../tools/dev_router.py),
-which covers the CLI-only commands REST has no equivalent for.
+For the host-side workflow around this — `.env` handling, `container list` /
+`logs` / `exec` over SSH — use [tools/dev_router.py](../tools/dev_router.py),
+which covers the CLI-only commands REST has no equivalent for. Deploying a
+compose project is not one of them: a project is a `put` to
+`config/container/projects`, which REST handles.
 
 ## Signal Handling in Polling Loops
 
