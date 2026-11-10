@@ -21,7 +21,6 @@ services:
       - VPN_PASSWORD=change-me
       - LAN_SUBNETS=192.168.0.0/24
       - VPN_DATA_PATH=auto
-    mem_limit: 128M
     healthcheck:
       # CMD-SHELL because this needs a pipe. Reports unhealthy whenever no
       # CHILD_SA is installed, which is the state that matters -- charon being

@@ -3,8 +3,13 @@
 Manages RTSP connection, frame decoding, disconnection detection,
 and automatic reconnection with exponential backoff.
 
-Uses PyAV (ffmpeg wrapper) for RTSP streaming instead of OpenCV
-for a smaller container footprint.
+Uses PyAV (ffmpeg wrapper) for RTSP streaming instead of OpenCV.
+
+The footprint rationale this comment used to give was wrong: this image also
+installs opencv-python-headless, whose wheels bundle FFmpeg and can open RTSP
+via cv2.VideoCapture(url, cv2.CAP_FFMPEG). So PyAV is a second copy of libav*
+here (~45 MB installed), not a saving. It does give finer control over demuxing
+and packet-level frame dropping, which is the honest reason to keep it.
 
 Requirements: 1.1, 1.2, 1.3, 1.4, 1.6, 1.7
 """

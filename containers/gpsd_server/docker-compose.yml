@@ -18,7 +18,6 @@ services:
       # not refreshed when a new image is deployed.
       - gpsd-history:/data
       - $CONFIG_STORE
-    mem_limit: 64M
     restart: unless-stopped
     healthcheck:
       # Covers both supervised processes: the poller and NMEA listener are
@@ -29,8 +28,10 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-    logging:
-      driver: json-file
+    # No `logging:` block. The engine attaches the syslog driver with
+    # `tag: {{.Name}}` regardless, so a json-file request is silently
+    # overridden and implies a driver you do not get. Container output goes to
+    # the router log; read it with `log show -i -s gpsd-server`.
 
 volumes:
   gpsd-history:

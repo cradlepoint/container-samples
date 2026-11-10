@@ -102,10 +102,12 @@ docker buildx build --platform linux/arm64 -t yourregistry/ncos-gpsd-server:late
 docker buildx build --platform linux/arm/v7 -t yourregistry/ncos-gpsd-server:latest-armv7 .
 ```
 
-Measured image sizes: **58.0 MB** for arm64 and **45.5 MB** for arm/v7.
-`mem_limit: 64M` is enough at runtime. That fits every supported model,
-including the 135 MB memory floor on AER2200 and IBR1700 with all key services
-enabled, and is small against the 6 GB flash on the most constrained models.
+Measured image sizes: **58.0 MB** for arm64 and **45.5 MB** for arm/v7. Runtime
+memory is well under 64 MB, which fits every supported model, including the
+135 MB memory floor on AER2200 and IBR1700 with all key services enabled, and is
+small against the 6 GB flash on the most constrained models. Do not add a
+`mem_limit` — on NCOS it is reported to cause containers to fail with unknown
+errors; keep the image minimal instead.
 
 ## Deployment
 
@@ -207,7 +209,7 @@ container still reports healthy.
 | gpsd reachable but always `mode: 1` | Working as intended with no lock. gpsd is being told there is no fix |
 | Map is blank with a note | Browser cannot reach the tile server. Track and marker still work |
 | History resets on redeploy | Volume data is not migrated to a new image. Create a new project for a fresh volume |
-| Container restarts every few minutes | Either process died; the supervisor exits non-zero on purpose. Check `container logs` for which one |
+| Container restarts every few minutes | Either process died; the supervisor exits non-zero on purpose. Check `log show -i -s gpsd-server` for which one (`container logs` commonly returns nothing on NCOS) |
 
 Useful commands inside the container:
 

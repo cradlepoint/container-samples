@@ -58,7 +58,9 @@ services:
 The `$CONFIG_STORE` volume is required for `cp.py` -- without it every poll
 logs a "no Config Store" message instead of GPS data. No ports are published.
 
-Watch `container logs gps_logger` to see the output.
+Read the output with `log show -i -s gps_logger` on the router. The engine
+attaches the syslog driver, so `container logs gps_logger` commonly returns
+nothing and that is not a fault.
 
 ## Troubleshooting
 

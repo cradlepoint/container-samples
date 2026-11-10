@@ -49,6 +49,7 @@ services:
       - API_PASSWORD=change-me
       - RTSP_USERNAME=admin
       - RTSP_PASSWORD=change-me
-    mem_limit: 128M
-    logging:
-      driver: json-file
+    # No `logging:` block. The engine attaches the syslog driver with
+    # `tag: {{.Name}}` regardless, so a json-file request is silently
+    # overridden and implies a driver you do not get. Container output goes to
+    # the router log; read it with `log show -i -s rtsp-viewer`.

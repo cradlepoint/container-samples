@@ -12,5 +12,9 @@ av==13.1.0
 # Performance: OpenCV for NEON-accelerated resize/color conversion
 opencv-python-headless==4.10.0.84
 
-# Required by cp.py for router API communication
+# NOT required by cp.py. The vendored cp.py is standard library only -- it
+# imported `requests` before being rewritten, and this comment described that
+# older version. Left pinned rather than removed because dropping a dependency
+# is a change to the built image, not a documentation fix; nothing in src/
+# imports it, so it is a candidate for removal.
 requests==2.32.3

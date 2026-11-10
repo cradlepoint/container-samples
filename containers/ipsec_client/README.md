@@ -26,7 +26,8 @@ NAT and MSS rules are identical either way.
   something is wrong.
 - **Observable from the log.** There is no web UI and no published port. Every
   state change is logged when it happens, with a periodic line restating an
-  unchanged state, so `container logs ipsec_client` is the status view.
+  unchanged state, so the router log (`log show -i -s ipsec_client`) is the
+  status view.
 
 ## Files
 
@@ -113,8 +114,9 @@ docker buildx build --platform linux/arm/v7 -t yourregistry/ipsec_client:latest-
 ```
 
 Measured image sizes: 161 MB (arm64), 98.7 MB (arm/v7). That is flash and pull
-cost; resident memory with a tunnel established is single-digit megabytes, well
-under the `mem_limit: 128M` in the compose files.
+cost; resident memory with a tunnel established is single-digit megabytes. Do not
+add a `mem_limit` to the compose files — on NCOS it is reported to cause
+containers to fail with unknown errors; keep the image minimal instead.
 
 About 30 MB of that is `libcurl4` and its transitive closure (krb5/GSSAPI, LDAP,
 nghttp2, psl, rtmp, ssh2, brotli, zstd), pulled in because the CRL/OCSP fetcher
@@ -193,7 +195,7 @@ verified.
 5. **Read the log before anything else.**
 
    ```bash
-   container logs ipsec_client
+   log show -i -s ipsec_client
    ```
 
    The `PREFLIGHT` lines confirm or deny each platform grant, and the
@@ -201,22 +203,25 @@ verified.
 
 ## Status and logging
 
-Everything goes to stdout and stderr, which the container runtime collects via the
-`json-file` driver. Lines are printed bare — no timestamp and no source prefix —
-because the driver already records a timestamp per line and the log is per
-container, so repeating either in the message only makes it harder to read.
+Everything goes to stdout and stderr. On NCOS the engine attaches the **syslog**
+driver, so the output lands in the router log and `container logs ipsec_client`
+commonly returns nothing — that is not a fault. Read it with:
 
-Retrieve it with `container logs ipsec_client`. The lines also surface in a
-router-side log view, where the carrier prefixes each one with a timestamp, a
-level and the container name — which is why the messages here are bare:
+```bash
+log show -i -s ipsec_client        # or: log show -f 200 to follow with history
+```
+
+The carrier prefixes each line with a timestamp, a level and the container name,
+which is why the messages themselves are printed bare:
 
 ```
 07:37:10 AM INFO ipsec_client SELECTED data path: userspace (interface ipsec0)
 ```
 
-There is no web interface and no published port. `container logs ipsec_client` is
-the status view, and `container exec ipsec_client swanctl --list-sas` gives live
-detail on demand.
+stdout arrives as `INFO` and stderr as `ERR`. There is no web interface and no
+published port, so the router log is the status view, and `container exec
+ipsec_client swanctl --list-sas` gives live detail on demand — run it from an
+interactive prompt, since `container exec` returns no output non-interactively.
 
 What gets logged, and when:
 

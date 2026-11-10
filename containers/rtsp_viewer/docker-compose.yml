@@ -15,7 +15,6 @@ services:
       - "8555:8555/udp"   # WebRTC media
     volumes:
       - ./go2rtc.yaml:/config/go2rtc.yaml:ro
-    mem_limit: 128M
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:1984/"]
       interval: 30s

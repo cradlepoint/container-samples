@@ -88,7 +88,6 @@ services:
       # Leave at 1. With 0, LAN traffic falls back to the router and leaves
       # unencrypted whenever the tunnel is down.
       - VPN_FAIL_CLOSED=1
-    mem_limit: 128M
     healthcheck:
       test: ["CMD-SHELL", "swanctl --list-sas 2>/dev/null | grep -q INSTALLED"]
       interval: 30s

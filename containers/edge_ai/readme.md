@@ -97,7 +97,12 @@ On first boot, any missing appdata entries are created with default values. Chan
 
 ## Performance Optimizations
 
-- **Multi-threaded TFLite** — Uses all available CPU cores for inference
+- **Multi-threaded TFLite** — Uses all available CPU cores for inference. Note
+  that all-cores is measurably *past* the optimum for both of these models: on an
+  8-core arm64 host, SSD MobileNet V2 ran at 10.2 ms with 4 threads against
+  11.1 ms with 8, and YOLOv5n INT8 at 6.9 ms against 9.5 ms. Capping the thread
+  count would be both faster and leave CPU for the router's own services, which
+  NCOS gives no Compose lever to protect.
 - **OpenCV NEON SIMD** — ARM64-optimized resize and color conversion
 - **In-place annotation** — OpenCV draws directly on numpy arrays (no PIL conversion)
 - **OpenCV JPEG encoding** — Faster than PIL for MJPEG streaming
@@ -148,7 +153,7 @@ edge_ai/
 | ai-edge-litert | TFLite inference runtime | ~37 MB |
 | av (PyAV) | RTSP capture via ffmpeg | ~45 MB |
 | Pillow | Placeholder image generation | ~3 MB |
-| requests | Router API communication (cp.py) | ~1 MB |
+| requests | Unused — `cp.py` is standard library only | ~1 MB |
 
 ## Deployment
 
@@ -174,13 +179,35 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
-    mem_limit: 1g
-    cpus: 4
 ```
+
+NCOS supports no resource-limit keys, so there is nothing to tune here: `cpus:` is
+not supported, and `mem_limit` is reported to cause containers to fail with unknown
+errors. Keep the image minimal to stay within the per-model budget instead.
 
 ### Router Deployment
 
-Deploy via the router's container management interface (REST API or NCM). The router exposes its config store socket to the container, enabling `cp.py` to read/write appdata without volume mounts.
+Deploy via the router's container management interface (REST API or NCM).
+
+Config store access is **not** automatic: the socket at `/var/tmp/cs.sock` exists
+only when the service lists `$CONFIG_STORE` as a bare entry (no mount target)
+under `volumes:`. Without it the path does not exist and every `cp.py` accessor
+returns `None`, so every setting in the Appdata table above silently falls back
+to its default. The Compose example above does not include it — add it when
+deploying to a router:
+
+```yaml
+version: "2.4"
+services:
+  edge-ai:
+    image: jongaudu/edge-ai:latest
+    container_name: edge-ai
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - $CONFIG_STORE
+```
 
 ## Development
 
@@ -197,9 +224,12 @@ pytest tests/ -v
 python src/main.py
 ```
 
-## Resource Constraints
+## Resource Usage
 
-| Resource | Limit |
+These are the resources this workload expects, not limits NCOS enforces — nothing
+here is set in Compose.
+
+| Resource | Expected |
 |----------|-------|
 | Container memory | 1 GB |
 | CPU cores | 4 |

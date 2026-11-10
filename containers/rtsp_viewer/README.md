@@ -144,8 +144,10 @@ docker buildx build --platform linux/arm/v7 -t yourregistry/rtsp-viewer:latest-a
 Measured image sizes: **116 MB** for arm64, **75.9 MB** for arm/v7 — larger
 than the other samples in this repo because of `ffmpeg` and its shared library
 dependencies, which go2rtc uses for on-the-fly transcoding of codecs the
-browser can't play natively. Idle memory use is under 25 MB; `mem_limit: 128M`
-leaves headroom for transcoding, which is heavier than idle relay.
+browser can't play natively. Idle memory use is under 25 MB, and transcoding is
+heavier than idle relay but still modest. Do not add a `mem_limit` — on NCOS it
+is reported to cause containers to fail with unknown errors; keep the image
+minimal instead.
 
 ## Deployment
 
