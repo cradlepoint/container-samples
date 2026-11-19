@@ -515,6 +515,27 @@ setup_firewall
 setup_routing
 
 # ----------------------------------------------------------------- run charon
+# Clear runtime state a previous run of this same container left behind. Files
+# outside volumes live in the writable layer and /run is not a tmpfs, so a charon
+# killed by SIGKILL leaves charon.vici behind for the next run. A stale
+# socket satisfies any "socket exists" test while nothing listens on it. A stale
+# charon.pid could make charon refuse to start as "already running" (UNVERIFIED,
+# not observed).
+# Reproduced on Docker Desktop 28.4.0: after a kill -9 of charon, every
+# restart-policy restart failed with "Connection refused". On a router (kernel
+# 6.6.52) the same kill -9 reproduces the loop on the unfixed image. With this
+# cleanup, the next run logs both "removed stale" lines and comes up normally. A
+# field router showed the loop from an unknown first failure. A power cut alone
+# does not trigger it: the unfixed image survived three.
+# Logged, not silent: the line shows a stale file was found, which otherwise
+# leaves no trace.
+for stale in /var/run/charon.vici /var/run/charon.pid; do
+    if [ -e "$stale" ]; then
+        rm -f "$stale"
+        log "removed stale ${stale} left by a previous run of this container"
+    fi
+done
+
 /usr/lib/ipsec/charon &
 CHARON_PID=$!
 
@@ -526,12 +547,15 @@ terminate() {
 }
 trap terminate TERM INT
 
-# Wait for the vici socket rather than sleeping a fixed interval.
+# Wait until charon actually answers on vici. The socket file appearing is not
+# readiness: it exists between bind() and listen(), and after a restart it may be
+# a stale file from the previous run. A harmless read is the only real test.
 i=0
-while [ ! -S /var/run/charon.vici ]; do
+until swanctl --stats >/dev/null 2>&1; do
     i=$((i + 1))
     if [ "$i" -gt 100 ]; then
-        fail "charon did not create its vici socket within 10s"
+        log "contents of /var/run: $(ls -la /var/run/ 2>&1 | tr '\n' ' ')"
+        fail "charon not accepting vici connections within 10s"
     fi
     if ! kill -0 "$CHARON_PID" 2>/dev/null; then
         fail "charon exited during startup"

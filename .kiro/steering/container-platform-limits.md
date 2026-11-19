@@ -51,8 +51,9 @@ is needed.
   image" or "this code" is answerable locally, "this kernel" or "this engine" is not.
 - The router kernel differs by model/firmware: R2400-5GF-NA on NCOS 7.26.100
   (build a324e6ff71) runs `6.6.52-ge0f9e2afd4cf-dirty` aarch64 (Yocto/poky, GCC
-  13.3.0); an earlier, unrecorded router ran `5.4.213-coconut+`. Probe results
-  taken on one kernel do not carry over to the other. The NCOS CLI has no `uname`
+  13.3.0); an earlier, unrecorded router ran `5.4.213-coconut+`; a field router
+  (model and firmware not captured) runs `5.15.144-perf`. Probe results taken on
+  one kernel do not carry over to another. The NCOS CLI has no `uname`
   (`Invalid command: uname`) and `status/` carries no kernel version, so read it
   from inside any container: `uname -r` / `cat /proc/version`.
 
@@ -107,6 +108,16 @@ is needed.
   `restart: "no"` for a one-shot probe with external side effects, do the work
   once, then idle so the log stays retrievable — a restart policy on a container
   that emits to an external system floods it.
+- A crash-looping container was restarted 60 s after each exit, over three
+  consecutive cycles in the router log (model and firmware not captured). The
+  first restarts after boot were not in the log, so their spacing is UNVERIFIED.
+  60 s matches Docker's backoff cap.
+- A restart-policy restart keeps the container's writable layer, so files outside
+  volumes, including `/run`, carry over to the next run. Confirmed: after `kill -9`
+  of strongSwan's charon, the next run found its dead `charon.vici` and looped on
+  `Connection refused` (kernel 6.6.52; model and NCOS version not captured).
+  Delete daemon sockets and pidfiles before starting the daemon, or a single
+  crash becomes a permanent loop.
 - Default to one process per container. Reach for a supervisor only when the
   processes must share a loopback interface or filesystem.
 - Alpine's `ash` has no `wait -n`, so the "block until any child exits" idiom
@@ -182,21 +193,23 @@ is needed.
   reporting healthy. Default-deny forwarding, allow only the intended egress plus
   the conntrack return direction, and verify both states — down (no leak) and up
   (still works).
-- Confirmed on a router (kernel `5.4.213-coconut+`, aarch64; model and firmware
-  not captured, so treat as one router and one firmware and re-probe on the
-  target): `cap_add: NET_ADMIN` is honoured, a `devices:` mapping of
-  `/dev/net/tun` is honoured, TUN creation works, netfilter `nat`/`filter` rules
-  install, and `net.ipv4.ip_forward` is `1`. None of this was re-probed on the
-  6.6.52 kernel (R2400-5GF-NA, 7.26.100) — UNVERIFIED there.
-- The **nf_tables backend has no usable `nat` table on the 5.4.213 router; the
-  legacy `ip_tables` backend works.** On 6.6.52 the nft `nat` table is UNVERIFIED,
-  so probe both backends rather than pinning legacy. Debian 12 and current Alpine both symlink
-  `iptables` to the nft implementation, so a container calling bare `iptables`
-  gets the backend that fails — the binary runs and the syntax is accepted, only
-  rule insertion fails. Probe both and use whichever has a working `nat` table.
-  The two backends cannot see each other's rules, so mixing them yields a ruleset
-  that looks half-applied.
-- The XFRM subsystem is reachable while XFRM **interfaces** are absent
+- Results from ipsec_client's own preflight on three kernels (aarch64). Model
+  and firmware were captured for none of them. The 6.6.52 build string matches
+  the R2400-5GF-NA on 7.26.100. Probe on the target device.
+  - **On all three:** `cap_add: NET_ADMIN` is honoured, the `/dev/net/tun`
+    `devices:` mapping is honoured, `nat`/`filter` rules install through some
+    backend, `ip_forward` is `1`, and the XFRM subsystem is reachable.
+  - **TUN creation:** works on 5.4.213 and 6.6.52. It fails on 5.15.144 with
+    `open: Permission denied`, even though the device is mapped.
+  - **XFRM interfaces:** absent on 5.4.213, present on 5.15.144 and 6.6.52.
+- **The nf_tables backend has no usable `nat` table on 5.4.213 or 6.6.52; legacy
+  `ip_tables` works there.** On 5.15.144 nft works, so pinning either backend
+  breaks some router. Debian 12 and current Alpine both symlink `iptables` to the
+  nft implementation, so bare `iptables` can get the failing backend: the binary
+  runs and the syntax is accepted, and only rule insertion fails. Probe both and
+  use whichever has a working `nat` table. The two backends cannot see each
+  other's rules, so mixing them yields a ruleset that looks half-applied.
+- On 5.4.213 the XFRM subsystem is reachable while XFRM **interfaces** are absent
   (`ip link add type xfrm` returns `Error: Unknown device type`). These are two
   separate kernel options; a subsystem being present does not mean the specific
   feature within it is.
@@ -204,11 +217,12 @@ is needed.
   claim from "this capability is absent", since a non-root process can hold
   `CAP_NET_RAW`.
 - Where a daemon offers both a kernel-facility implementation and a userspace one
-  needing only a TUN/TAP device, prefer the userspace path. It scopes the request
-  to the container's own namespace, fails predictably rather than with `EPERM`
-  deep inside third-party code, and usually encapsulates in UDP — which matters
-  because containers on the default bridge sit behind the router's SNAT and a
-  protocol that is neither TCP nor UDP has no translatable header.
+  needing only a TUN/TAP device, ship both and select at startup by probe. Neither
+  is available everywhere: XFRM interfaces are absent on 5.4.213, and TUN creation
+  is denied on 5.15.144. When both work, the userspace path usually encapsulates
+  in UDP. That matters because containers on the default bridge sit behind the
+  router's SNAT, and a protocol that is neither TCP nor UDP has no translatable
+  header.
 - Many network daemons bind `127.0.0.1` by default. The symptom is a published
   port that appears completely dead while the process runs and the mapping is
   correct; confirm with `netstat -ltn` inside the container. The inverse is
@@ -605,7 +619,10 @@ alert\n<value>\n             ->  no reply; the socket blocks waiting for the
   loop — no project delete-and-recreate and no NCM UI. The new image was live
   about 30 seconds after the command on an **R2400-5GF-NA running NCOS
   7.26.81**, and it survived everything that should survive: named-volume
-  contents, appdata settings, and the project's compose string. Confirm the swap
+  contents, appdata settings, and the project's compose string. The writable
+  layer did not survive. Pulling a new image over a crash-looping ipsec_client
+  started with none of its predecessor's stale `/run` files (kernel 6.6.52; model
+  and firmware not captured). Confirm the swap
   by comparing the container's `Image` field in `status/container` against the
   pushed manifest's `config.digest` rather than by watching a timestamp. The
   command prints nothing over non-interactive SSH, which is normal.
@@ -697,6 +714,11 @@ costs unnecessary architecture, not just a wrong sentence.
 - Strict field counts for `get`/`put`/`post`/`delete`/`decrypt` (confirmed for
   `alert` only).
 - Whether host-to-container Unix socket bind mounts work (deliberately avoided).
+- Whether a container's writable layer survives a power cycle or a graceful
+  reboot. A restart-policy restart keeps it (see "Compose" above). Evidence against
+  the power-cycle case: an unfixed ipsec_client, which fails every time it meets
+  a stale `charon.vici`, came up fine after three power cuts taken with the
+  tunnel up (model and firmware not captured). A graceful reboot is untested.
 
 When a probe closes one of these, record the result with the **device model and
 firmware version** next to it. Without those the observation cannot be scoped and

@@ -244,6 +244,23 @@ the socket path from memory — take it from the daemon's own configuration or d
 and on timeout list the directory you were watching, so the log distinguishes
 "never created" from "created elsewhere".
 
+**`rm -f` the daemon's socket and pidfile before starting it.** Files outside
+volumes live in the container's writable layer, and `/run` is not a tmpfs. A
+daemon killed by SIGKILL leaves its socket behind. A restart-policy restart keeps
+the layer, so a `-S` wait then passes at once against a dead socket. Every restart then
+fails the same way. A stale pidfile can also make a daemon refuse to start as
+"already running" (UNVERIFIED, not observed).
+
+Reproduced on Docker Desktop 28.4.0: after a `kill -9` of charon, every
+restart-policy restart of a `-S`-gated `swanctl --load-all` hit `Connection
+refused`. The same `kill -9` on a router reproduces the loop, confirming that
+`cpdockerengine` keeps the writable layer across a restart-policy restart.
+Deleting both files before starting charon fixes it there: the next run logs the
+removals and comes up normally (kernel 6.6.52; model and NCOS version not
+captured). A field router showed the
+same loop from an unknown first failure. A power cut alone does not trigger it:
+the unfixed image survived three.
+
 **A recovery mechanism will hide this from you.** In the observed case the daemon
 had its own "load config at startup" action and the container had a watchdog, so
 the session came up anyway and everything looked healthy — the only evidence was
@@ -1435,37 +1452,33 @@ returning `0` or a partial match looks like a finding rather than a mistake.
 
 ### Linux Capabilities — Partly Confirmed
 
-**Observed on a router** (kernel `5.4.213-coconut+`, aarch64), from a container's
-own startup preflight with `cap_add: [NET_ADMIN]` and
-`devices: [/dev/net/tun:/dev/net/tun]` in its compose:
+**Observed on three routers** (aarch64), from ipsec_client's own startup preflight
+with `cap_add: [NET_ADMIN]` and `devices: [/dev/net/tun:/dev/net/tun]` in its
+compose. Model and firmware were not captured for any of them. The 6.6.52 build
+string, `6.6.52-ge0f9e2afd4cf-dirty`, matches an R2400-5GF-NA on NCOS 7.26.100.
 
-| Probe | Result |
-|-------|--------|
-| `cap_add: NET_ADMIN` honoured (add/del an `ip rule`) | **ok** |
-| `devices:` mapping honoured (`/dev/net/tun` present) | **ok** |
-| Create a TUN device (`ip tuntap add`) | **ok** |
-| `iptables -t nat` chain create/delete | **ok, but only via the legacy backend** — see below |
-| `iptables -t filter` chain create/delete | **ok, legacy backend** |
-| `net.ipv4.ip_forward` | **`1`** |
-| `ip xfrm state` (XFRM subsystem reachable) | **ok** |
-| `ip link add type xfrm` (XFRM *interface* support) | **absent** — `Error: Unknown device type` |
+| Probe | `5.4.213-coconut+` | `5.15.144-perf` | `6.6.52-ge0f9e2afd4cf-dirty` |
+|-------|----|----|----|
+| `cap_add: NET_ADMIN` honoured (add/del an `ip rule`) | **ok** | **ok** | **ok** |
+| `devices:` mapping honoured (`/dev/net/tun` present) | **ok** | **ok** | **ok** |
+| Create a TUN device (`ip tuntap add`) | **ok** | **denied**: `open: Permission denied` | **ok** |
+| `iptables -t nat` chain create/delete | **legacy only** | **ok, nft** | **legacy only** |
+| `iptables -t filter` chain create/delete | **ok, legacy** | **ok, nft** | **ok, legacy** |
+| `net.ipv4.ip_forward` | **`1`** | **`1`** | **`1`** |
+| `ip xfrm state` (XFRM subsystem reachable) | **ok** | **ok** | **ok** |
+| `ip link add type xfrm` (XFRM *interface* support) | **absent**: `Error: Unknown device type` | **ok** | **ok** |
 
-So `cap_add`, `devices:` and netfilter rule installation all work, which several
-designs in this repo previously had to treat as open questions. Note what remains
-unconfirmed: **`CAP_NET_RAW`** (raw sockets, for `ping`'s raw mode, packet crafting,
-`tcpreplay`) was not probed, and neither was whether a compose `sysctls:` entry is
-honoured. Model and firmware were not captured alongside the kernel version, so
-treat this as "one router, one firmware" rather than fleet-wide and re-probe on the
-target device. That caution holds: an R2400-5GF-NA on NCOS 7.26.100 runs kernel
-`6.6.52-ge0f9e2afd4cf-dirty`, a different major version, and none of the table
-above has been re-run on it (UNVERIFIED there). Read the kernel from inside any
-container with `uname -r`; the NCOS CLI has no `uname` and `status/` does not
-report it.
+So `cap_add`, `devices:` and netfilter rule installation work everywhere, but no
+single data path or netfilter backend does. Still unconfirmed: **`CAP_NET_RAW`**
+(raw sockets, for `ping`'s raw mode, packet crafting, `tcpreplay`), and whether a
+compose `sysctls:` entry is honoured. Re-probe on the target device. Read the
+kernel from inside any container with `uname -r`; the NCOS CLI has no `uname`
+and `status/` does not report it.
 
 The XFRM result matters beyond IPsec: **the XFRM subsystem being reachable does not
-mean XFRM interfaces exist.** Those are separate kernel options, and a design
-needing a routable tunnel interface from kernel IPsec has no path on this kernel —
-only the userspace/TUN alternative.
+mean XFRM interfaces exist.** Those are separate kernel options. On 5.4.213 a
+design needing a routable tunnel interface from kernel IPsec has only the
+userspace/TUN alternative. On 5.15.144 that alternative is the one denied.
 
 Each probe is one command, and they run through `container exec` in any container
 already deployed — though see the caveats on `container exec` under Troubleshooting,
@@ -1485,13 +1498,13 @@ installed is capability policy.** Both fall in the "does not transfer" buckets
 above, so a NAT or firewall design that worked on a development machine has not
 been shown to work on the router — only that the rules and the logic are right.
 
-#### The nf_tables backend does not work on 5.4; probe both backends
+#### The nf_tables backend works on some kernels and not others; probe both
 
 **This will break any container that runs `iptables` on these routers, silently and
-by default.** Observed on kernel `5.4.213-coconut+`: the **nf_tables** backend has
-no usable `nat` table, while the **legacy** `ip_tables` backend works fine. On
-kernel `6.6.52` (R2400-5GF-NA, NCOS 7.26.100) the nft `nat` table is UNVERIFIED,
-so probe rather than pin.
+by default.** On kernels `5.4.213-coconut+` and `6.6.52-ge0f9e2afd4cf-dirty` the
+**nf_tables** backend has no usable `nat` table, while the **legacy** `ip_tables`
+backend works. On `5.15.144-perf` the nft backend works. Pinning either backend
+therefore breaks some router.
 
 ```
 netfilter backend iptables-nft: no usable nat table, trying the next
@@ -1501,11 +1514,11 @@ PREFLIGHT ok : netfilter nat table writable (iptables-legacy)
 
 Modern distributions ship `iptables` as a symlink to the **nft** implementation —
 Debian 12 and current Alpine both do — so a container that simply calls `iptables`
-gets the backend that does not work here. The binary runs, the syntax is accepted,
-and the rule insertion fails.
+gets the nft backend whether or not it works on that kernel. The binary runs, the
+syntax is accepted, and the rule insertion fails.
 
-Two ways to handle it, and the first is better because it degrades on a future
-kernel that gains nft support:
+Probe both backends. Pinning one is only safe for a single known kernel, because
+the routers disagree:
 
 ```sh
 # Probe both and use whichever has a working nat table.
@@ -1517,8 +1530,6 @@ for candidate in iptables-nft iptables-legacy; do
 done
 [ -n "${IPT:-}" ] || { echo "no usable netfilter backend" >&2; exit 1; }
 
-# Or pin it, if you accept re-checking when the firmware kernel changes.
-IPT=iptables-legacy
 ```
 
 Then call `"$IPT"` everywhere rather than bare `iptables`, and **log which backend
@@ -1634,22 +1645,18 @@ The general shape applies to any kernel state a container cannot modify: the
 question is not "how do we set this" but "what is it already, and is that
 survivable".
 
-### Prefer the Implementation With the Smallest Privilege Surface
+### Ship Both the Kernel and the Userspace Implementation
 
 Where a daemon offers both a kernel-facility implementation and a userspace one
-that needs nothing but a TUN/TAP device, default to the userspace path on this
-platform. It asks only for capabilities scoped to the container's own network
-namespace, it degrades predictably (slower) rather than mysteriously (`EPERM`
-deep inside third-party code), and it avoids the unverified question of what
-kernel state a remapped namespace is allowed to touch. Many network daemons ship
-such an implementation precisely because they get run in restricted containers
-elsewhere.
+that needs nothing but a TUN/TAP device, ship both and pick at startup by probe.
+Neither is available on every router: XFRM interfaces are absent on 5.4.213, and
+TUN creation is denied on 5.15.144 (see the capability table above). A container
+that offers only one path fails outright on some router. Log which path was
+selected, and honour an explicit request rather than silently downgrading.
 
-A userspace data path also tends to encapsulate its traffic in UDP, which helps
-independently: containers on the default bridge sit behind the router's SNAT, and
-a protocol that is neither TCP nor UDP has no translatable header. Treat the
-kernel-facility path as an optimisation to confirm on hardware, not as the
-design.
+When both work, the userspace path tends to encapsulate its traffic in UDP, which
+helps independently: containers on the default bridge sit behind the router's
+SNAT, and a protocol that is neither TCP nor UDP has no translatable header.
 
 **Before switching implementations later, list what the current design depends on
 as an artifact of the present one.** Two implementations of the same capability

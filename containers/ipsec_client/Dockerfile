@@ -10,10 +10,10 @@
 # Why Debian and not Alpine, which is this repo's default base:
 # Alpine's `strongswan` package does not ship the `libipsec` / `kernel-libipsec`
 # plugin -- checked on 3.18, 3.20 and 3.22, whose only subpackages are doc,
-# logfile and openrc. Without it the only data path is kernel XFRM, whose
-# availability inside a container on this platform is unverified. Debian ships
-# the userspace path in a package, so the container can ask for nothing beyond
-# CAP_NET_ADMIN and /dev/net/tun. Cost of that choice, measured with
+# logfile and openrc. Without it the only data path is kernel XFRM, and XFRM
+# interfaces are absent on the 5.4.213 router kernel. Debian ships the userspace
+# path in a package, so both are in the image and the entrypoint picks one by
+# probe. Neither is universal: TUN creation is denied on 5.15.144. Cost of that choice, measured with
 # `docker image ls`: see README. Runtime RSS is single-digit megabytes.
 FROM debian:12-slim
 
